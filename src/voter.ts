@@ -240,22 +240,57 @@ async function login(page: Page, email: string, log: (m: string) => void): Promi
 
 // ── Vote ─────────────────────────────────────────────────────────────────────
 
+const SUBMISSION_ID = 'e2efa077-c740-456d-89ef-915473b3961d';
+
 async function vote(page: Page, log: (m: string) => void): Promise<boolean> {
+  // Try the fast path first: call the vote API directly via fetch inside the
+  // browser context (which carries the session cookies).  This avoids loading
+  // the heavy Next.js submission page entirely.
+  log('Voting via API…');
+  try {
+    const apiResult = await page.evaluate(async (subId: string) => {
+      const payloads = [
+        { submissionId: subId },
+        { id: subId },
+        { submission_id: subId },
+      ];
+      for (const body of payloads) {
+        const res = await fetch('/api/vote', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const json = await res.json().catch(() => null);
+        if (json && json.success) return { ok: true, count: json.voteCount ?? null, key: Object.keys(body)[0] };
+        if (res.status === 401) return { ok: false, count: null, key: 'unauthorized' };
+      }
+      return { ok: false, count: null, key: 'all-payloads-failed' };
+    }, SUBMISSION_ID);
+
+    if (apiResult.ok) {
+      log(`Vote registered ✓ (API, count: ${apiResult.count ?? '?'})`);
+      return true;
+    }
+    if (apiResult.key === 'unauthorized') {
+      log('Vote API returned 401 — not logged in');
+      return false;
+    }
+    log(`API vote failed (${apiResult.key}) — falling back to UI…`);
+  } catch (err) {
+    log(`API vote error: ${err} — falling back to UI…`);
+  }
+
+  // Fallback: load the full submission page and click the button
   log('Navigating to submission…');
   await page.goto(SUBMISSION_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
   if (!await waitForCheckpoint(page, log, 'main, button')) return false;
   await page.waitForTimeout(2000);
 
   try {
-    // The vote button: rounded pill with heart SVG + <span class="font-mono font-bold">count</span>
-    // Disabled + "Sign in to vote" when logged out; enabled when logged in.
-    // After clicking, the heart turns red/filled — the count may not update in
-    // the DOM immediately, so we detect success by class/style change on the button.
     const voteBtn = page.locator('button:has(span.font-mono)').first();
 
     if (await voteBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
       const isDisabled = await voteBtn.isDisabled();
-      const btnClass = await voteBtn.getAttribute('class') ?? '';
       const countBefore = await voteBtn.locator('span.font-mono').textContent().catch(() => '?');
       log(`Vote button: count=${countBefore} disabled=${isDisabled}`);
 
@@ -265,7 +300,6 @@ async function vote(page: Page, log: (m: string) => void): Promise<boolean> {
         return false;
       }
 
-      // Intercept the vote API response
       let apiSuccess = false;
       let apiCount: number | null = null;
       const voteResponsePromise = page.waitForResponse(
@@ -276,11 +310,8 @@ async function vote(page: Page, log: (m: string) => void): Promise<boolean> {
           const json = await resp.json() as { success?: boolean; voteCount?: number };
           apiSuccess = !!json.success;
           apiCount   = json.voteCount ?? null;
-          log(`Vote API: success=${json.success} voteCount=${json.voteCount}`);
         } catch { /* ignore */ }
-      }).catch(() => {
-        log('Vote API response not captured (may still have worked)');
-      });
+      }).catch(() => {});
 
       await voteBtn.scrollIntoViewIfNeeded();
       await voteBtn.click();
@@ -291,33 +322,10 @@ async function vote(page: Page, log: (m: string) => void): Promise<boolean> {
         log(`Vote registered ✓ (count: ${countBefore} → ${apiCount ?? '?'})`);
         return true;
       }
-
-      // Fallback: read the DOM count after click
-      await page.waitForTimeout(2000);
-      const countAfter = await voteBtn.locator('span.font-mono').textContent().catch(() => '?');
-      const classAfter = await voteBtn.getAttribute('class') ?? '';
-
-      if (countBefore !== countAfter) {
-        log(`Vote registered ✓ (DOM count: ${countBefore} → ${countAfter})`);
-        return true;
-      }
-      if (classAfter.includes('accent-red') || classAfter.includes('text-red')) {
-        log('Vote accepted ✓ (button switched to active/red state)');
-        return true;
-      }
-
-      await snap(page, 'vote-uncertain');
-      log(`Vote uncertain — count ${countAfter}, class=${classAfter.slice(0, 60)}`);
-      return false;
     }
 
     await snap(page, 'vote-fail');
-    const btns = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('button')).map(b =>
-        `"${b.textContent?.trim().slice(0, 30)}" disabled=${b.disabled} class="${b.className.slice(0, 50)}"`
-      )
-    );
-    log(`Vote button not found. Buttons: ${btns.slice(0, 6).join(' | ')}`);
+    log('Vote button not found or vote failed');
     return false;
   } catch (err) {
     log(`Vote error: ${err}`);
@@ -410,7 +418,12 @@ export async function runVoteSession(
       log('Login failed — trying to vote anyway in case we have a session…');
     }
 
-    // 6. Vote
+    // 6. Ensure we're on creativeaward.ai before voting (needed for API fetch)
+    if (!mainPage.url().includes('creativeaward.ai')) {
+      await mainPage.goto('https://www.creativeaward.ai/', { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    }
+
+    // 7. Vote
     const voted = await vote(mainPage, log);
     if (voted) return { result: 'success', email };
 
