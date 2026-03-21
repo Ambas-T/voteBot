@@ -362,6 +362,9 @@ export async function runVoteSession(
   }
 
   try {
+    // 0. Clear previous session so signup page renders fresh
+    await context.clearCookies();
+
     // 1. Get temp mailbox via mail.tm API — server-side, never touches the Tor proxy
     let mailbox: Awaited<ReturnType<typeof getTempMailbox>>;
     try {
