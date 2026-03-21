@@ -2,11 +2,11 @@
   "name": "votebot",
   "version": "1.0.0",
   "description": "Automated voting bot with web UI — paste emails, vote via Tor",
-  "main": "dist/index.js",
+  "main": "dist/api/index.js",
   "scripts": {
     "start": "ts-node src/index.ts",
     "build": "tsc",
-    "start:prod": "npm run build && node dist/index.js"
+    "start:prod": "npm run build && node dist/api/index.js"
   },
   "keywords": [],
   "author": "",

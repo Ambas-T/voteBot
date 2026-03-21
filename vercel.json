@@ -1,20 +1,11 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "src/server.ts",
-      "use": "@vercel/node",
-      "config": {
-        "includeFiles": ["ui/**", "src/**"]
-      }
-    }
-  ],
-  "routes": [
-    { "src": "/(.*)", "dest": "/src/server.ts" }
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api" }
   ],
   "functions": {
-    "src/server.ts": {
-      "maxDuration": 300
+    "api/index.ts": {
+      "maxDuration": 300,
+      "includeFiles": "ui/**"
     }
   }
 }
