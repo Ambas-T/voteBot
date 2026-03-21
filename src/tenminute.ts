@@ -1,84 +1,63 @@
 /**
- * Temporary email via the mail.tm public REST API.
- * https://api.mail.tm
+ * Temporary email via the Guerrilla Mail public API.
+ * https://www.guerrillamail.com  (API compatible with 10minutemail concept)
  *
- * All calls are plain Node.js fetch — they run in the server process and are
- * completely independent of the Tor/SOCKS5 proxy that Playwright uses.
- * This means temp email creation and inbox polling work whether or not Tor
- * is enabled, and regardless of which browser context is active.
+ * All calls are plain Node.js fetch — completely independent of the Tor/SOCKS5
+ * proxy used by Playwright.  The browser context only ever opens creativeaward.ai.
  *
  * Flow:
- *   1. GET  /domains           → pick a live domain
- *   2. POST /accounts          → create a random address + password
- *   3. POST /token             → obtain a Bearer JWT for that inbox
- *   4. GET  /messages (poll)   → wait until a message arrives
- *   5. GET  /messages/{id}     → read the body, extract the verification link
+ *   1. GET get_email_address  → fresh address + session token
+ *   2. GET check_email        → poll inbox (every 5 s)
+ *   3. GET fetch_email        → read body, extract verification link
  */
 
-const BASE = 'https://api.mail.tm';
+const API = 'https://api.guerrillamail.com/ajax.php';
 
 const VERIFY_KEYWORDS = ['verify', 'confirm', 'activation', 'activate', 'token', 'validate'];
+
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Accept':     'application/json',
+};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface TempMailbox {
-  address: string;
-  login:   string;
-  domain:  string;
-  token:   string; // Bearer JWT for this inbox
+  address:  string;
+  login:    string;
+  domain:   string;
+  token:    string; // sid_token — must be passed in every subsequent call
 }
 
-interface HydraPage<T> { 'hydra:member': T[] }
-interface DomainItem   { domain: string }
-interface MsgItem      { id: string; subject: string }
-interface MsgDetail    { id: string; subject: string; html: string[]; text: string }
+interface SessionResp  { email_addr: string; sid_token: string }
+interface InboxResp    { list: MailMeta[]; count: number }
+interface MailMeta     { mail_id: string; mail_subject: string }
+interface MailBodyResp { mail_id: string; mail_subject: string; mail_body: string }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function randomStr(len: number): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  return Array.from({ length: len }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
-}
-
-async function mailtmFetch<T>(path: string, opts: RequestInit = {}): Promise<T> {
-  const resp = await fetch(`${BASE}${path}`, {
-    ...opts,
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', ...opts.headers },
-  });
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => '');
-    throw new Error(`mail.tm ${path}: HTTP ${resp.status} — ${body.slice(0, 200)}`);
-  }
+async function gm<T>(params: Record<string, string>): Promise<T> {
+  const qs  = new URLSearchParams(params).toString();
+  const resp = await fetch(`${API}?${qs}`, { headers: HEADERS });
+  if (!resp.ok) throw new Error(`guerrillamail ${params['f']}: HTTP ${resp.status}`);
   return resp.json() as Promise<T>;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 export async function getTempMailbox(log: (m: string) => void): Promise<TempMailbox> {
-  log('Creating temp email via mail.tm…');
+  log('Getting temp email from 10minutemail…');
 
-  const domainsPage = await mailtmFetch<HydraPage<DomainItem>>('/domains?page=1');
-  const domains = domainsPage['hydra:member'];
-  if (!domains?.length) throw new Error('mail.tm returned no available domains');
-  const domain = domains[Math.floor(Math.random() * domains.length)].domain;
+  const data = await gm<SessionResp>({ f: 'get_email_address' });
 
-  // Timestamp prefix (base-36, always increasing) + random suffix → guaranteed unique
-  const address  = `${Date.now().toString(36)}${randomStr(6)}@${domain}`;
-  const password = randomStr(20);
+  if (!data.email_addr?.includes('@')) {
+    throw new Error(`Unexpected response: ${JSON.stringify(data)}`);
+  }
 
-  await mailtmFetch<unknown>('/accounts', {
-    method: 'POST',
-    body:   JSON.stringify({ address, password }),
-  });
-
-  const { token } = await mailtmFetch<{ token: string }>('/token', {
-    method: 'POST',
-    body:   JSON.stringify({ address, password }),
-  });
-
-  const login = address.split('@')[0];
+  const address = data.email_addr.trim();
+  const [login, domain] = address.split('@');
   log(`Temp email: ${address}`);
-  return { address, login, domain, token };
+  return { address, login, domain, token: data.sid_token };
 }
 
 export async function waitForVerificationLink(
@@ -87,30 +66,29 @@ export async function waitForVerificationLink(
   timeoutMs = 120_000,
 ): Promise<string | null> {
   const deadline = Date.now() + timeoutMs;
-  const authHeader = { Authorization: `Bearer ${mailbox.token}` };
   log('Polling inbox for verification email…');
 
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 5000));
 
-    let msgs: MsgItem[];
+    let inbox: InboxResp;
     try {
-      const page = await mailtmFetch<HydraPage<MsgItem>>(
-        '/messages?page=1', { headers: authHeader }
-      );
-      msgs = page['hydra:member'] ?? [];
+      inbox = await gm<InboxResp>({ f: 'check_email', seq: '0', sid_token: mailbox.token });
     } catch (err) {
       log(`Inbox poll error: ${err} — retrying…`);
       continue;
     }
 
+    const msgs = inbox.list ?? [];
     if (msgs.length === 0) { log('No messages yet…'); continue; }
 
     log(`Inbox: ${msgs.length} message(s) — reading…`);
+
     for (const meta of msgs) {
-      const link = await readAndExtractLink(meta.id, authHeader, log);
+      const link = await fetchAndExtractLink(meta.mail_id, mailbox.token, log);
       if (link) return link;
     }
+
     log('No verification link found yet — retrying…');
   }
 
@@ -118,42 +96,37 @@ export async function waitForVerificationLink(
   return null;
 }
 
-// ── Internals ─────────────────────────────────────────────────────────────────
+// ── Internal ──────────────────────────────────────────────────────────────────
 
-async function readAndExtractLink(
-  id: string,
-  authHeader: Record<string, string>,
-  log: (m: string) => void,
+async function fetchAndExtractLink(
+  mailId: string,
+  token:  string,
+  log:    (m: string) => void,
 ): Promise<string | null> {
   try {
-    const msg = await mailtmFetch<MsgDetail>(`/messages/${id}`, { headers: authHeader });
-    log(`Email subject: "${msg.subject}"`);
+    const msg = await gm<MailBodyResp>({ f: 'fetch_email', email_id: mailId, sid_token: token });
+    log(`Email subject: "${msg.mail_subject}"`);
 
-    const bodies: string[] = [
-      ...(Array.isArray(msg.html) ? msg.html : [msg.html ?? '']),
-      msg.text ?? '',
-    ].filter(Boolean);
+    const body = msg.mail_body ?? '';
 
-    for (const content of bodies) {
-      // href="..." attributes
-      for (const m of content.matchAll(/href=["']([^"']+)["']/gi)) {
-        const href = m[1];
-        if (VERIFY_KEYWORDS.some(k => href.toLowerCase().includes(k))) {
-          log(`Verification link: ${href.slice(0, 90)}`);
-          return href;
-        }
+    // href="..." attributes
+    for (const m of body.matchAll(/href=["']([^"']+)["']/gi)) {
+      const href = m[1];
+      if (VERIFY_KEYWORDS.some(k => href.toLowerCase().includes(k))) {
+        log(`Verification link: ${href.slice(0, 90)}`);
+        return href;
       }
-      // Bare https?:// URLs
-      for (const m of content.matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
-        const url = m[0].replace(/[.,;)\]]+$/, '');
-        if (VERIFY_KEYWORDS.some(k => url.toLowerCase().includes(k))) {
-          log(`Verification link (plain): ${url.slice(0, 90)}`);
-          return url;
-        }
+    }
+    // Bare https?:// URLs
+    for (const m of body.matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
+      const url = m[0].replace(/[.,;)\]]+$/, '');
+      if (VERIFY_KEYWORDS.some(k => url.toLowerCase().includes(k))) {
+        log(`Verification link (plain): ${url.slice(0, 90)}`);
+        return url;
       }
     }
   } catch (err) {
-    log(`Read message error: ${err}`);
+    log(`Fetch email error: ${err}`);
   }
   return null;
 }

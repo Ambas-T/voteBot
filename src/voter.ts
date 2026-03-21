@@ -2,10 +2,10 @@
  * Core vote logic.
  *
  * Flow per session:
- *   1. Call mail.tm API (server-side, bypasses Tor proxy) → fresh temp email
+ *   1. Call 10minutemail API (server-side, bypasses Tor proxy) → fresh temp email
  *   2. Generate an Ethiopian name via Groq (or local pool)
  *   3. Sign up on creativeaward.ai with that email  (through Tor)
- *   4. Poll mail.tm API for the verification email, navigate to the link  (through Tor)
+ *   4. Poll 10minutemail inbox for the verification email, navigate to the link  (through Tor)
  *   5. Log in (if not already logged in after verification)  (through Tor)
  *   6. Vote on the submission page  (through Tor)
  */
@@ -273,9 +273,9 @@ export async function runVoteSession(
     const signupResult = await signup(mainPage, email, firstName, lastName, log);
     if (signupResult === 'fail') return { result: 'fail-signup', email };
 
-    // 4. Poll mail.tm inbox for verification link — server-side, no Tor proxy involved
+    // 4. Poll 10minutemail inbox for verification link — server-side, no Tor proxy involved
     if (signupResult === 'verify-needed') {
-      log('Polling mail.tm inbox for verification link…');
+      log('Polling 10minutemail inbox for verification link…');
       const verifyLink = await waitForVerificationLink(mailbox, log);
       if (!verifyLink) {
         log('No verification link received — aborting');
