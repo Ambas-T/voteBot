@@ -139,13 +139,8 @@ async function signup(
     const url  = page.url();
     const body = (await page.textContent('body') ?? '').toLowerCase();
 
-    if (body.includes('already') || body.includes('exists') || body.includes('registered')) {
-      log('Already registered — proceeding to login');
-      return 'already';
-    }
-
-    // Email verification required — check this BEFORE the URL check, because
-    // the site may stay on /signup while showing "check your email"
+    // Check for verification FIRST — the signup page may include text like
+    // "Already have an account?" which would falsely match a naive "already" check.
     if (
       body.includes('check your email') || body.includes('check_your_email') ||
       body.includes('check your inbox') || body.includes('verification link') ||
@@ -157,13 +152,23 @@ async function signup(
       return 'verify-needed';
     }
 
+    if (
+      body.includes('already registered') || body.includes('already exists') ||
+      body.includes('already in use') || body.includes('email exists') ||
+      body.includes('account exists') || body.includes('email already')
+    ) {
+      await snap(page, 'signup-already');
+      log(`Already registered — body snippet: ${body.slice(0, 200)}`);
+      return 'already';
+    }
+
     if (!url.includes('/signup')) {
       log(`Signup OK → ${url}`);
       return 'ok';
     }
 
     await snap(page, 'signup-fail');
-    log(`Signup may have failed — URL: ${url}`);
+    log(`Signup may have failed — URL: ${url} — body: ${body.slice(0, 200)}`);
     return 'fail';
   } catch (err) {
     log(`Signup error: ${err}`);

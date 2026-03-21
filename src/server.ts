@@ -111,44 +111,66 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
 
   // ── Background loop ──────────────────────────────────────────────────────
   (async () => {
-    let idx = 0;
+    let successInBatch = 0;
+    let consecutiveFails = 0;
 
-    while (idx < count && !state.aborted) {
-      const batchSize = Math.min(VOTES_PER_SESSION, count - idx);
-      broadcastLog(`\n━━ Opening Tor browser for ${batchSize} session(s)…`);
+    async function rotateCircuit() {
+      if (isTorEnabled()) {
+        broadcastLog('[tor] Rotating circuit…');
+        await rotateTorIP();
+        await waitForNewCircuit(15_000);
+        broadcastLog('[tor] New circuit ready.');
+      } else {
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    }
+
+    while (state.done < count && !state.aborted) {
+      const remaining = count - state.done;
+      const batchSize = Math.min(VOTES_PER_SESSION, remaining);
+      broadcastLog(`\n━━ Opening browser for ${batchSize} vote(s)…`);
 
       let browser: Awaited<ReturnType<typeof launchSession>>['browser'] | null = null;
       let context: Awaited<ReturnType<typeof launchSession>>['context'] | null = null;
+      successInBatch = 0;
 
       try {
         const session = await launchSession();
         browser = session.browser;
         context = session.context;
-        // Close the initial blank page — runVoteSession creates its own pages
         await session.page.close().catch(() => undefined);
 
         for (let b = 0; b < batchSize && !state.aborted; b++) {
-          const n = idx + b + 1;
-          broadcastLog(`── [${n}/${count}] Starting vote session…`);
+          broadcastLog(`── [${state.done + 1}/${count}] Starting vote session…`);
 
           const { result, email } = await runVoteSession(context, broadcastLog);
 
           state.done++;
           if (result === 'success') {
             state.success++;
+            successInBatch++;
+            consecutiveFails = 0;
             broadcastLog(`✅ [${state.done}/${state.total}] Vote succeeded${email ? ` — ${email}` : ''}`);
           } else {
             state.failed++;
+            consecutiveFails++;
             broadcastLog(`❌ [${state.done}/${state.total}] Failed (${result})${email ? ` — ${email}` : ''}`);
+
+            // If we get a failure, the Tor exit is likely flagged — break
+            // out of this batch so we rotate the circuit immediately
+            if (consecutiveFails >= 1) {
+              broadcastLog('Failure detected — will rotate circuit before next attempt');
+              break;
+            }
           }
           broadcastVoteResult(email, result, result === 'success');
           broadcastStats(state.done, state.total, state.success, state.failed);
         }
       } catch (err) {
         broadcastLog(`❌ Session error: ${err}`);
-        const skipped = batchSize - (state.done - idx);
-        state.done   += skipped;
-        state.failed += skipped;
+        state.done++;
+        state.failed++;
+        consecutiveFails++;
         broadcastStats(state.done, state.total, state.success, state.failed);
       } finally {
         if (context) await context.close().catch(() => undefined);
@@ -156,18 +178,9 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
         broadcastLog('Browser closed.');
       }
 
-      idx += batchSize;
-
-      // Rotate Tor before the next batch
-      if (idx < count && !state.aborted) {
-        if (isTorEnabled()) {
-          broadcastLog('[tor] Rotating circuit…');
-          await rotateTorIP();
-          await waitForNewCircuit(15_000);
-          broadcastLog('[tor] New circuit ready.');
-        } else {
-          await new Promise(r => setTimeout(r, 1500));
-        }
+      // Rotate Tor circuit before the next batch
+      if (state.done < count && !state.aborted) {
+        await rotateCircuit();
       }
     }
 
