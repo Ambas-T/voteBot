@@ -36,7 +36,12 @@ const sseClients: Response[] = [];
 
 function broadcast(type: string, payload: object) {
   const data = `data: ${JSON.stringify({ type, ...payload })}\n\n`;
-  sseClients.forEach(c => { try { c.write(data); } catch { /* ignore */ } });
+  for (let i = sseClients.length - 1; i >= 0; i--) {
+    try {
+      if (sseClients[i].writableEnded) { sseClients.splice(i, 1); continue; }
+      sseClients[i].write(data);
+    } catch { sseClients.splice(i, 1); }
+  }
 }
 
 function broadcastLog(msg: string) {
@@ -148,10 +153,10 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
 
           for (let b = 0; b < batchSize && !state.aborted; b++) {
             // Claim this vote slot (first one was already claimed above)
-            if (b > 0 && claimVote() === null) break;
+            const voteIdx = b === 0 ? firstVote : (claimVote() ?? -1);
+            if (voteIdx < 0) break;
 
-            const voteNum = state.done + 1;
-            broadcastLog(`[W${workerId}] ── [${voteNum}/${count}] Starting vote…`);
+            broadcastLog(`[W${workerId}] ── [${voteIdx + 1}/${count}] Starting vote…`);
 
             const { result, email } = await runVoteSession(context, (msg) =>
               broadcastLog(`[W${workerId}] ${msg}`),
@@ -160,10 +165,10 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
             state.done++;
             if (result === 'success') {
               state.success++;
-              broadcastLog(`[W${workerId}] ✅ [${state.done}/${count}] Vote succeeded${email ? ` — ${email}` : ''}`);
+              broadcastLog(`[W${workerId}] ✅ [${voteIdx + 1}/${count}] Vote succeeded${email ? ` — ${email}` : ''}`);
             } else {
               state.failed++;
-              broadcastLog(`[W${workerId}] ❌ [${state.done}/${count}] Failed (${result})${email ? ` — ${email}` : ''}`);
+              broadcastLog(`[W${workerId}] ❌ [${voteIdx + 1}/${count}] Failed (${result})${email ? ` — ${email}` : ''}`);
             }
             broadcastVoteResult(email, result, result === 'success');
             broadcastStats(state.done, state.total, state.success, state.failed);
@@ -182,7 +187,9 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
     }
 
     broadcastLog(`Launching ${PARALLEL_BROWSERS} parallel workers (${VOTES_PER_SESSION} votes/browser)…`);
-    const workers = Array.from({ length: PARALLEL_BROWSERS }, (_, i) => worker(i + 1));
+    const workers = Array.from({ length: PARALLEL_BROWSERS }, (_, i) =>
+      new Promise(r => setTimeout(r, i * 2000)).then(() => worker(i + 1)),
+    );
     await Promise.all(workers);
 
     if (state.aborted) broadcastLog('🛑 Stopped by user.');
