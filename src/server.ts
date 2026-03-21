@@ -124,9 +124,14 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
 
     /** Single worker: opens a browser, runs up to VOTES_PER_SESSION votes, closes browser, repeats. */
     async function worker(workerId: number) {
+      let launchFails = 0;
       while (!state.aborted) {
         const firstVote = claimVote();
         if (firstVote === null) return;
+        if (launchFails >= 3) {
+          broadcastLog(`[W${workerId}] Too many launch failures — worker stopping`);
+          return;
+        }
 
         const batchSize = Math.min(VOTES_PER_SESSION, count - firstVote);
         broadcastLog(`[W${workerId}] Opening browser for ${batchSize} vote(s)…`);
@@ -138,6 +143,7 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
           const session = await launchSession();
           browser = session.browser;
           context = session.context;
+          launchFails = 0;
           await session.page.close().catch(() => undefined);
 
           for (let b = 0; b < batchSize && !state.aborted; b++) {
@@ -166,6 +172,7 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
           broadcastLog(`[W${workerId}] ❌ Session error: ${err}`);
           state.done++;
           state.failed++;
+          launchFails++;
           broadcastStats(state.done, state.total, state.success, state.failed);
         } finally {
           if (context) await context.close().catch(() => undefined);

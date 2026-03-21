@@ -143,9 +143,9 @@ export async function launchSession(opts?: { headless?: boolean }): Promise<Brow
     return { browser, context, page };
   }
 
-  // ── Local path: playwright-core with manual stealth (parallel-safe) ─────
+  // ── Local path: playwright with manual stealth (parallel-safe) ──────────
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { chromium } = require('playwright-core');
+  const { chromium } = require('playwright');
 
   const headless =
     opts?.headless !== undefined ? opts.headless : process.env.SHOW_BROWSER !== 'true';
