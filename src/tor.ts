@@ -22,7 +22,8 @@ type Logger = (msg: string) => void;
 const noop: Logger = () => {};
 
 export function isTorEnabled(): boolean {
-  return process.env.TOR_ENABLED === 'true';
+  const raw = process.env.TOR_ENABLED ?? '';
+  return raw.trim().toLowerCase() === 'true';
 }
 
 export function getTorProxyUrl(): string {

@@ -9,7 +9,9 @@
  *   GET  /api/status            — Current status JSON
  */
 
-import 'dotenv/config';
+import dotenv from 'dotenv';
+dotenv.config({ override: true });
+
 import express from 'express';
 import path from 'path';
 import type { Request, Response } from 'express';
@@ -21,7 +23,7 @@ const app  = express();
 const PORT = parseInt(process.env.UI_PORT ?? '3000', 10);
 
 const VOTES_PER_SESSION = parseInt(process.env.VOTES_PER_SESSION ?? '3', 10);
-console.log(`[config] VOTES_PER_SESSION=${VOTES_PER_SESSION}  TOR_ENABLED=${isTorEnabled()}`);
+console.log(`[config] VOTES_PER_SESSION=${VOTES_PER_SESSION}  TOR_ENABLED=${isTorEnabled()}  (raw: "${process.env.TOR_ENABLED}")`);
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'ui')));
