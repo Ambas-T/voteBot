@@ -169,6 +169,11 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
             } else {
               state.failed++;
               broadcastLog(`[W${workerId}] ❌ [${voteIdx + 1}/${count}] Failed (${result})${email ? ` — ${email}` : ''}`);
+              if (result === 'fail-signup') {
+                const wait = 10 + workerId * 3;
+                broadcastLog(`[W${workerId}] Signup rate-limited — cooling ${wait}s…`);
+                await new Promise(r => setTimeout(r, wait * 1000));
+              }
             }
             broadcastVoteResult(email, result, result === 'success');
             broadcastStats(state.done, state.total, state.success, state.failed);
