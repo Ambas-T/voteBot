@@ -11,6 +11,7 @@
 
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import type { Page } from 'playwright';
 
 const SIGNUP_URL     = 'https://www.creativeaward.ai/signup?callbackUrl=%2Fmy-submissions';
@@ -19,8 +20,23 @@ const SUBMISSION_URL = 'https://www.creativeaward.ai/submission/e2efa077-c740-45
 
 const PASSWORD = process.env.ACCOUNT_PASSWORD?.replace(/^"|"$/g, '') ?? 'ta123#$55';
 
-const SHOT_DIR = path.join(process.cwd(), 'screenshots');
-if (!fs.existsSync(SHOT_DIR)) fs.mkdirSync(SHOT_DIR, { recursive: true });
+/** Vercel/serverless FS is read-only except /tmp — never mkdir under cwd there. */
+function resolveShotDir(): string {
+  const candidates = process.env.VERCEL
+    ? [path.join(os.tmpdir(), 'votebot-screenshots')]
+    : [path.join(process.cwd(), 'screenshots'), path.join(os.tmpdir(), 'votebot-screenshots')];
+  for (const dir of candidates) {
+    try {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      return dir;
+    } catch {
+      /* try next */
+    }
+  }
+  return os.tmpdir();
+}
+
+const SHOT_DIR = resolveShotDir();
 
 // ── Random name pool ────────────────────────────────────────────────────────
 
