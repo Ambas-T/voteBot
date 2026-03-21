@@ -26,6 +26,18 @@ const LOGIN_URL  = 'https://www.creativeaward.ai/login?callbackUrl=%2Fmy-submiss
 const PASSWORD = process.env.ACCOUNT_PASSWORD?.replace(/^"|"$/g, '') ?? 'ta123#$55';
 
 /**
+ * Detect when the page HTML loaded but React/Next.js never hydrated.
+ * The body text will be the inline theme-script blob rather than real content.
+ */
+function isUnhydratedPage(body: string): boolean {
+  const stripped = body.trim();
+  if (stripped.length === 0) return true;
+  if (stripped.length < 300 && /^\(/.test(stripped)) return true;
+  if (/^[\s(]*\(?\s*function|\(\s*\(?\s*[a-z],/i.test(stripped)) return true;
+  return false;
+}
+
+/**
  * Wait for the Vercel Security Checkpoint to clear, with retry.
  * Returns true if the expected selector appeared, false if stuck/blocked.
  */
@@ -35,8 +47,15 @@ async function waitForCheckpoint(
   waitForSelector: string,
   timeoutMs = 15_000,
 ): Promise<boolean> {
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     const body = (await page.textContent('body') ?? '').toLowerCase();
+
+    if (isUnhydratedPage(body)) {
+      log(`Page not hydrated (attempt ${attempt + 1}/3) — reloading…`);
+      await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+      await page.waitForTimeout(4000);
+      continue;
+    }
 
     if (body.includes('failed to verify your browser')) {
       log('Checkpoint blocked — retrying…');
@@ -53,8 +72,8 @@ async function waitForCheckpoint(
       await page.waitForSelector(waitForSelector, { state: 'visible', timeout: timeoutMs });
       return true;
     } catch {
-      if (attempt === 0) {
-        log('Checkpoint did not clear — retrying…');
+      if (attempt < 2) {
+        log('Target selector not visible — retrying…');
         await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
         await page.waitForTimeout(2000);
       }
@@ -134,13 +153,19 @@ async function signup(
 
     await page.waitForTimeout(400);
     await page.locator('button[type="submit"], input[type="submit"]').first().click();
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(4000);
 
     const url  = page.url();
     const body = (await page.textContent('body') ?? '').toLowerCase();
 
-    // Check for verification FIRST — the signup page may include text like
-    // "Already have an account?" which would falsely match a naive "already" check.
+    // If the response page is just the Next.js inline script (React didn't hydrate),
+    // the Vercel checkpoint is blocking this exit IP.
+    if (isUnhydratedPage(body)) {
+      await snap(page, 'signup-blocked');
+      log('Signup response blocked — page did not hydrate (Vercel checkpoint)');
+      return 'fail';
+    }
+
     if (
       body.includes('check your email') || body.includes('check_your_email') ||
       body.includes('check your inbox') || body.includes('verification link') ||

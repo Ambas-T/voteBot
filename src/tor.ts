@@ -18,6 +18,9 @@ import fs  from 'fs';
 import os  from 'os';
 import path from 'path';
 
+type Logger = (msg: string) => void;
+const noop: Logger = () => {};
+
 export function isTorEnabled(): boolean {
   return process.env.TOR_ENABLED === 'true';
 }
@@ -29,18 +32,26 @@ export function getTorProxyUrl(): string {
 
 // ── Cookie-file authentication ─────────────────────────────────────────────
 
-/**
- * Read the Tor cookie file and return it as a hex string for AUTHENTICATE.
- * Tor Browser writes it to one of several known locations on Windows.
- */
-function readTorCookieHex(): string | null {
+const COOKIE_NAME = 'control_auth_cookie';
+const TB_SUFFIX   = ['Browser', 'TorBrowser', 'Data', 'Tor', COOKIE_NAME];
+
+function readTorCookieHex(log: Logger): string | null {
+  const home = os.homedir();
   const candidates = [
-    // Tor Browser (standard install)
-    path.join(os.homedir(), 'Desktop', 'Tor Browser', 'Browser', 'TorBrowser', 'Data', 'Tor', 'control_auth_cookie'),
-    path.join(os.homedir(), 'Downloads', 'Tor Browser', 'Browser', 'TorBrowser', 'Data', 'Tor', 'control_auth_cookie'),
-    // AppData roaming (some versions)
-    path.join(os.homedir(), 'AppData', 'Roaming', 'tor', 'control_auth_cookie'),
-    // Explicit override via env
+    path.join(home, 'Desktop', 'Tor Browser', ...TB_SUFFIX),
+    path.join(home, 'Downloads', 'Tor Browser', ...TB_SUFFIX),
+    // Common Windows "Documents" install
+    path.join(home, 'Documents', 'Tor Browser', ...TB_SUFFIX),
+    // Program-Files–style installs
+    'C:\\Tor Browser\\Browser\\TorBrowser\\Data\\Tor\\' + COOKIE_NAME,
+    'C:\\Program Files\\Tor Browser\\Browser\\TorBrowser\\Data\\Tor\\' + COOKIE_NAME,
+    'C:\\Program Files (x86)\\Tor Browser\\Browser\\TorBrowser\\Data\\Tor\\' + COOKIE_NAME,
+    // OneDrive–redirected Desktop
+    path.join(home, 'OneDrive', 'Desktop', 'Tor Browser', ...TB_SUFFIX),
+    // Standalone tor daemon (choco / scoop)
+    path.join(home, 'AppData', 'Roaming', 'tor', COOKIE_NAME),
+    path.join(home, 'AppData', 'Local', 'tor', COOKIE_NAME),
+    // Explicit override
     process.env.TOR_COOKIE_FILE ?? '',
   ].filter(Boolean);
 
@@ -48,27 +59,30 @@ function readTorCookieHex(): string | null {
     try {
       if (fs.existsSync(p)) {
         const cookie = fs.readFileSync(p);
-        console.log(`[tor] Using cookie file: ${p}`);
+        log(`[tor] Cookie file found: ${p}`);
         return cookie.toString('hex');
       }
     } catch { /* try next */ }
   }
+
+  log('[tor] ⚠ No cookie file found — tried: ' + candidates.map(c => path.basename(path.dirname(c))).join(', '));
   return null;
 }
 
 // ── NEWNYM — request a fresh exit node ────────────────────────────────────
 
-export async function rotateTorIP(): Promise<void> {
+export async function rotateTorIP(log: Logger = noop): Promise<boolean> {
   const controlPort = parseInt(process.env.TOR_CONTROL_PORT ?? '9151', 10);
   const password    = process.env.TOR_CONTROL_PASSWORD?.trim() ?? '';
 
-  // Prefer cookie auth; fall back to password auth; last resort: no-auth
-  const cookieHex = password ? null : readTorCookieHex();
+  const cookieHex = password ? null : readTorCookieHex(log);
   const authLine  = cookieHex
     ? `AUTHENTICATE ${cookieHex}\r\n`
     : password
       ? `AUTHENTICATE "${password}"\r\n`
       : 'AUTHENTICATE\r\n';
+
+  log(`[tor] Sending NEWNYM to 127.0.0.1:${controlPort} (auth=${cookieHex ? 'cookie' : password ? 'password' : 'none'})`);
 
   return new Promise((resolve) => {
     const sock = net.createConnection({ port: controlPort, host: '127.0.0.1' }, () => {
@@ -80,29 +94,44 @@ export async function rotateTorIP(): Promise<void> {
     let response = '';
     sock.on('data', (d) => { response += d.toString(); });
     sock.on('close', () => {
+      const trimmed = response.trim().replace(/\r?\n/g, ' | ');
       if (response.includes('250')) {
-        console.log('[tor] New circuit requested ✓');
+        log(`[tor] New circuit requested ✓  (${trimmed.slice(0, 100)})`);
+        resolve(true);
       } else {
-        console.warn('[tor] Unexpected control response:', response.trim().slice(0, 120));
+        log(`[tor] ⚠ NEWNYM failed — response: ${trimmed.slice(0, 150)}`);
+        resolve(false);
       }
-      resolve();
     });
     sock.on('error', (err) => {
       if (err.message.includes('ECONNREFUSED')) {
-        console.warn('[tor] Control port not reachable — add "ControlPort 9151" to torrc and restart Tor Browser');
+        log('[tor] ⚠ Control port refused — is Tor running with ControlPort 9151?');
       } else {
-        console.warn(`[tor] Rotate error: ${err.message}`);
+        log(`[tor] ⚠ Rotate error: ${err.message}`);
       }
-      resolve(); // always non-fatal
+      resolve(false);
     });
-    setTimeout(() => { sock.destroy(); resolve(); }, 5_000);
+    setTimeout(() => { sock.destroy(); resolve(false); }, 5_000);
   });
 }
 
 /**
  * After NEWNYM, wait for Tor to build a fresh circuit.
- * Microsoft exit-node blocks make 10 s the minimum; 15 s is safer.
+ * 10s minimum; 15s is safer for exit-node diversity.
  */
 export async function waitForNewCircuit(ms = 15_000): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Fetch our current exit IP through the Tor SOCKS proxy. */
+export async function checkTorIP(log: Logger = noop): Promise<string | null> {
+  try {
+    const resp = await fetch('https://api.ipify.org?format=text', { signal: AbortSignal.timeout(10_000) });
+    const ip = (await resp.text()).trim();
+    log(`[tor] Current exit IP: ${ip}`);
+    return ip;
+  } catch {
+    log('[tor] Could not determine exit IP');
+    return null;
+  }
 }

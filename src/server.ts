@@ -14,14 +14,14 @@ import express from 'express';
 import path from 'path';
 import type { Request, Response } from 'express';
 import { launchSession } from './browser';
-import { isTorEnabled, rotateTorIP, waitForNewCircuit } from './tor';
+import { isTorEnabled, rotateTorIP, waitForNewCircuit, checkTorIP } from './tor';
 import { runVoteSession, SUBMISSION_URL } from './voter';
 
 const app  = express();
 const PORT = parseInt(process.env.UI_PORT ?? '3000', 10);
 
-// Rotate Tor every N sessions (default 2)
-const VOTES_PER_SESSION = parseInt(process.env.VOTES_PER_SESSION ?? '2', 10);
+const VOTES_PER_SESSION = parseInt(process.env.VOTES_PER_SESSION ?? '3', 10);
+console.log(`[config] VOTES_PER_SESSION=${VOTES_PER_SESSION}  TOR_ENABLED=${isTorEnabled()}`);
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'ui')));
@@ -117,11 +117,16 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
     async function rotateCircuit() {
       if (isTorEnabled()) {
         broadcastLog('[tor] Rotating circuit…');
-        await rotateTorIP();
+        const ok = await rotateTorIP(broadcastLog);
+        if (!ok) {
+          broadcastLog('[tor] ⚠ Rotation failed — will continue with current circuit');
+        }
+        broadcastLog('[tor] Waiting 15s for new circuit…');
         await waitForNewCircuit(15_000);
-        broadcastLog('[tor] New circuit ready.');
+        broadcastLog('[tor] Ready — opening next batch.');
       } else {
-        await new Promise(r => setTimeout(r, 1500));
+        broadcastLog('[tor] Tor not enabled — pausing 2s between batches');
+        await new Promise(r => setTimeout(r, 2000));
       }
     }
 
@@ -138,6 +143,15 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
         const session = await launchSession();
         browser = session.browser;
         context = session.context;
+
+        // Quick exit-IP check so we can verify rotation is working
+        if (isTorEnabled()) {
+          try {
+            await session.page.goto('https://api.ipify.org/', { waitUntil: 'domcontentloaded', timeout: 15_000 });
+            const ip = (await session.page.textContent('body') ?? '').trim();
+            if (ip) broadcastLog(`[tor] Exit IP: ${ip}`);
+          } catch { /* non-fatal */ }
+        }
         await session.page.close().catch(() => undefined);
 
         for (let b = 0; b < batchSize && !state.aborted; b++) {
