@@ -209,42 +209,78 @@ async function login(page: Page, email: string, log: (m: string) => void): Promi
 async function vote(page: Page, log: (m: string) => void): Promise<boolean> {
   log('Navigating to submission…');
   await page.goto(SUBMISSION_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-  if (!await waitForCheckpoint(page, log, 'button, [class*="vote"], [class*="like"]')) return false;
-  await page.waitForTimeout(1500);
+  if (!await waitForCheckpoint(page, log, 'main, button')) return false;
+  await page.waitForTimeout(2000);
 
   try {
-    const sels = [
-      'button[aria-label*="vote" i]',
-      'button[aria-label*="like" i]',
-      'button[aria-label*="heart" i]',
-      '[class*="vote"]:not(span):not(div):not(p)',
-      '[class*="like"]:not(span):not(div):not(p)',
-      'button:has(svg)',
-      '[data-testid*="vote"]',
-      '[data-testid*="like"]',
-    ];
+    // The vote button: rounded pill with heart SVG + <span class="font-mono font-bold">count</span>
+    // Disabled + "Sign in to vote" when logged out; enabled when logged in.
+    // After clicking, the heart turns red/filled — the count may not update in
+    // the DOM immediately, so we detect success by class/style change on the button.
+    const voteBtn = page.locator('button:has(span.font-mono)').first();
 
-    for (const sel of sels) {
-      try {
-        const els = page.locator(sel);
-        const cnt = await els.count();
-        for (let i = 0; i < cnt; i++) {
-          const el = els.nth(i);
-          if (await el.isVisible({ timeout: 1000 })) {
-            await el.scrollIntoViewIfNeeded();
-            await el.click();
-            await page.waitForTimeout(1500);
-            log(`Voted ✓  (${sel})`);
-            return true;
-          }
-        }
-      } catch { /* try next */ }
+    if (await voteBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      const isDisabled = await voteBtn.isDisabled();
+      const btnClass = await voteBtn.getAttribute('class') ?? '';
+      const countBefore = await voteBtn.locator('span.font-mono').textContent().catch(() => '?');
+      log(`Vote button: count=${countBefore} disabled=${isDisabled}`);
+
+      if (isDisabled) {
+        log('Vote button is disabled — not logged in');
+        await snap(page, 'vote-not-logged-in');
+        return false;
+      }
+
+      // Intercept the vote API response
+      let apiSuccess = false;
+      let apiCount: number | null = null;
+      const voteResponsePromise = page.waitForResponse(
+        resp => resp.url().includes('/api/vote') && resp.request().method() === 'POST',
+        { timeout: 10_000 },
+      ).then(async resp => {
+        try {
+          const json = await resp.json() as { success?: boolean; voteCount?: number };
+          apiSuccess = !!json.success;
+          apiCount   = json.voteCount ?? null;
+          log(`Vote API: success=${json.success} voteCount=${json.voteCount}`);
+        } catch { /* ignore */ }
+      }).catch(() => {
+        log('Vote API response not captured (may still have worked)');
+      });
+
+      await voteBtn.scrollIntoViewIfNeeded();
+      await voteBtn.click();
+      log('Clicked vote button…');
+      await voteResponsePromise;
+
+      if (apiSuccess) {
+        log(`Vote registered ✓ (count: ${countBefore} → ${apiCount ?? '?'})`);
+        return true;
+      }
+
+      // Fallback: read the DOM count after click
+      await page.waitForTimeout(2000);
+      const countAfter = await voteBtn.locator('span.font-mono').textContent().catch(() => '?');
+      const classAfter = await voteBtn.getAttribute('class') ?? '';
+
+      if (countBefore !== countAfter) {
+        log(`Vote registered ✓ (DOM count: ${countBefore} → ${countAfter})`);
+        return true;
+      }
+      if (classAfter.includes('accent-red') || classAfter.includes('text-red')) {
+        log('Vote accepted ✓ (button switched to active/red state)');
+        return true;
+      }
+
+      await snap(page, 'vote-uncertain');
+      log(`Vote uncertain — count ${countAfter}, class=${classAfter.slice(0, 60)}`);
+      return false;
     }
 
     await snap(page, 'vote-fail');
     const btns = await page.evaluate(() =>
       Array.from(document.querySelectorAll('button')).map(b =>
-        `"${b.textContent?.trim().slice(0, 30)}" aria="${b.getAttribute('aria-label') ?? ''}" class="${b.className.slice(0, 50)}"`
+        `"${b.textContent?.trim().slice(0, 30)}" disabled=${b.disabled} class="${b.className.slice(0, 50)}"`
       )
     );
     log(`Vote button not found. Buttons: ${btns.slice(0, 6).join(' | ')}`);
@@ -312,24 +348,32 @@ export async function runVoteSession(
       }
       log('Navigating to verification link…');
       await mainPage.goto(verifyLink, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-      await mainPage.waitForTimeout(2000);
-      log('Email verified ✓');
+      await mainPage.waitForTimeout(3000);
+
+      // The verification redirect may pass through resend-links.com → creativeaward.ai
+      // Wait for the final destination to load
+      const verifyUrl = mainPage.url();
+      log(`After verification → ${verifyUrl}`);
+
+      // Check if we landed on a page that requires further action
+      const verifyBody = (await mainPage.textContent('body') ?? '').toLowerCase();
+      if (verifyBody.includes('verified') || verifyBody.includes('success') || verifyBody.includes('confirmed')) {
+        log('Email verified ✓');
+      } else {
+        log('Verification page loaded — proceeding');
+      }
     }
 
-    // 5. Try to vote directly — verification often auto-logs us in
-    log('Attempting to vote directly (may already be logged in)…');
-    const directVote = await vote(mainPage, log);
-    if (directVote) return { result: 'success', email };
-
-    // If vote page redirected to login, or the "sign in to vote" prompt appeared, log in explicitly
-    if (mainPage.url().includes('/login') || mainPage.url().includes('/signup')) {
-      log('Not logged in — trying explicit login…');
-      const loggedIn = await login(mainPage, email, log);
-      if (!loggedIn) return { result: 'fail-login', email };
-
-      const retryVote = await vote(mainPage, log);
-      return { result: retryVote ? 'success' : 'fail-vote', email };
+    // 5. Log in explicitly — even if verification redirected us, we need a
+    //    proper session. The vote button is disabled without auth.
+    const loggedIn = await login(mainPage, email, log);
+    if (!loggedIn) {
+      log('Login failed — trying to vote anyway in case we have a session…');
     }
+
+    // 6. Vote
+    const voted = await vote(mainPage, log);
+    if (voted) return { result: 'success', email };
 
     return { result: 'fail-vote', email };
   } catch (err) {
