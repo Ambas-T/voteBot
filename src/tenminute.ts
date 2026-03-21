@@ -46,15 +46,25 @@ async function gm<T>(params: Record<string, string>): Promise<T> {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 export async function getTempMailbox(log: (m: string) => void): Promise<TempMailbox> {
-  log('Getting temp email from 10minutemail…');
+  log('Getting temp email…');
 
+  // Get a session first
   const data = await gm<SessionResp>({ f: 'get_email_address' });
+  if (!data.sid_token) throw new Error('No session token from guerrillamail');
 
-  if (!data.email_addr?.includes('@')) {
-    throw new Error(`Unexpected response: ${JSON.stringify(data)}`);
+  // Force a unique username so we never collide with a previously-registered address
+  const unique = 'vb' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  const updated = await gm<SessionResp>({
+    f: 'set_email_user',
+    email_user: unique,
+    sid_token: data.sid_token,
+  });
+
+  const address = (updated.email_addr ?? '').trim();
+  if (!address.includes('@')) {
+    throw new Error(`Unexpected response: ${JSON.stringify(updated)}`);
   }
 
-  const address = data.email_addr.trim();
   const [login, domain] = address.split('@');
   log(`Temp email: ${address}`);
   return { address, login, domain, token: data.sid_token };
