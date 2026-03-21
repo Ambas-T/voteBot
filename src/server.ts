@@ -92,7 +92,7 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
   }
 
   const rawCount = parseInt(String(req.body?.count ?? '0'), 10);
-  const count    = Number.isFinite(rawCount) && rawCount > 0 ? Math.min(rawCount, 100) : 0;
+  const count    = Number.isFinite(rawCount) && rawCount > 0 ? Math.min(rawCount, 3000) : 0;
 
   if (count === 0) {
     res.json({ ok: false, error: 'Provide count (1–100)' });
@@ -168,15 +168,22 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
             successInBatch++;
             consecutiveFails = 0;
             broadcastLog(`✅ [${state.done}/${state.total}] Vote succeeded${email ? ` — ${email}` : ''}`);
+            // Brief cooldown between successful votes to avoid signup rate limits
+            if (state.done < count) {
+              broadcastLog('Cooling down 5s before next vote…');
+              await new Promise(r => setTimeout(r, 5000));
+            }
           } else {
             state.failed++;
             consecutiveFails++;
             broadcastLog(`❌ [${state.done}/${state.total}] Failed (${result})${email ? ` — ${email}` : ''}`);
 
-            // If we get a failure, the Tor exit is likely flagged — break
-            // out of this batch so we rotate the circuit immediately
-            if (consecutiveFails >= 1) {
-              broadcastLog('Failure detected — will rotate circuit before next attempt');
+            if (result === 'fail-signup' && consecutiveFails <= 3) {
+              // Signup rejection = likely rate-limited; wait longer before retrying
+              broadcastLog('Signup rate-limited — waiting 15s before retry…');
+              await new Promise(r => setTimeout(r, 15_000));
+            } else if (consecutiveFails >= 3) {
+              broadcastLog('3 consecutive failures — rotating proxy');
               break;
             }
           }

@@ -185,6 +185,12 @@ async function signup(
       return 'already';
     }
 
+    if (body.includes('signup failed') || body.includes('registration failed') || body.includes('try again later')) {
+      await snap(page, 'signup-rejected');
+      log('Signup rejected by server (likely rate-limited)');
+      return 'fail';
+    }
+
     if (!url.includes('/signup')) {
       log(`Signup OK → ${url}`);
       return 'ok';
