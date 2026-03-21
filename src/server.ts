@@ -2,10 +2,11 @@
  * VoteBot UI server.
  *
  * Endpoints
- *   GET  /api/events       — Server-Sent Events (logs + status + stats)
- *   POST /api/vote/start   — Start voting  { emails: string[] }
- *   POST /api/vote/stop    — Abort a running session
- *   GET  /api/status       — Current status JSON
+ *   GET  /api/events            — Server-Sent Events (logs + status + stats)
+ *   POST /api/vote/start        — Start voting  { count: number }
+ *   POST /api/vote/stop         — Abort a running session
+ *   POST /api/manual/open-browser — Local only: visible browser on submission URL
+ *   GET  /api/status            — Current status JSON
  */
 
 import 'dotenv/config';
@@ -14,13 +15,13 @@ import path from 'path';
 import type { Request, Response } from 'express';
 import { launchSession } from './browser';
 import { isTorEnabled, rotateTorIP, waitForNewCircuit } from './tor';
-import { runVoteForEmail } from './voter';
+import { runVoteSession, SUBMISSION_URL } from './voter';
 
 const app  = express();
 const PORT = parseInt(process.env.UI_PORT ?? '3000', 10);
 
-// Rotate Tor every N emails (default 2)
-const EMAILS_PER_SESSION = parseInt(process.env.EMAILS_PER_SESSION ?? '2', 10);
+// Rotate Tor every N sessions (default 2)
+const VOTES_PER_SESSION = parseInt(process.env.VOTES_PER_SESSION ?? '2', 10);
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'ui')));
@@ -38,6 +39,9 @@ function broadcastLog(msg: string)                    { broadcast('log',    { me
 function broadcastStatus(status: string)              { broadcast('status', { status }); }
 function broadcastStats(done: number, total: number, success: number, failed: number) {
   broadcast('stats', { done, total, success, failed });
+}
+function broadcastVoteResult(email: string, result: string, success: boolean) {
+  broadcast('vote_result', { email, result, success });
 }
 
 app.get('/api/events', (req: Request, res: Response) => {
@@ -67,6 +71,8 @@ const state = {
   failed:  0,
 };
 
+let manualBrowserOpen = false;
+
 // ── Endpoints ──────────────────────────────────────────────────────────────
 
 app.post('/api/vote/start', async (req: Request, res: Response) => {
@@ -74,37 +80,39 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
     res.json({ ok: false, error: 'Already running — stop first' });
     return;
   }
+  if (manualBrowserOpen) {
+    res.json({ ok: false, error: 'Close the manual browser window first' });
+    return;
+  }
 
-  const emails: string[] = (req.body?.emails ?? [])
-    .map((e: string) => e.trim())
-    .filter((e: string) => e.includes('@'));
+  const rawCount = parseInt(String(req.body?.count ?? '0'), 10);
+  const count    = Number.isFinite(rawCount) && rawCount > 0 ? Math.min(rawCount, 100) : 0;
 
-  if (emails.length === 0) {
-    res.json({ ok: false, error: 'No valid emails provided' });
+  if (count === 0) {
+    res.json({ ok: false, error: 'Provide count (1–100)' });
     return;
   }
 
   state.status  = 'voting';
   state.aborted = false;
   state.done    = 0;
-  state.total   = emails.length;
+  state.total   = count;
   state.success = 0;
   state.failed  = 0;
 
   broadcastStatus('voting');
-  broadcastStats(0, emails.length, 0, 0);
-  broadcastLog(`── Starting ${emails.length} vote(s) ──`);
+  broadcastStats(0, count, 0, 0);
+  broadcastLog(`── Starting ${count} vote session(s) ──`);
 
-  res.json({ ok: true, count: emails.length });
+  res.json({ ok: true, count });
 
   // ── Background loop ──────────────────────────────────────────────────────
   (async () => {
     let idx = 0;
 
-    while (idx < emails.length && !state.aborted) {
-      // Open a new Tor browser session for up to EMAILS_PER_SESSION emails
-      const batch = emails.slice(idx, idx + EMAILS_PER_SESSION);
-      broadcastLog(`\n━━ Opening Tor browser for ${batch.length} email(s)…`);
+    while (idx < count && !state.aborted) {
+      const batchSize = Math.min(VOTES_PER_SESSION, count - idx);
+      broadcastLog(`\n━━ Opening Tor browser for ${batchSize} session(s)…`);
 
       let browser: Awaited<ReturnType<typeof launchSession>>['browser'] | null = null;
       let context: Awaited<ReturnType<typeof launchSession>>['context'] | null = null;
@@ -113,32 +121,29 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
         const session = await launchSession();
         browser = session.browser;
         context = session.context;
-        let page = session.page;
+        // Close the initial blank page — runVoteSession creates its own pages
+        await session.page.close().catch(() => undefined);
 
-        for (let b = 0; b < batch.length && !state.aborted; b++) {
-          const email = batch[b];
-          broadcastLog(`── [${idx + b + 1}/${emails.length}] ${email}`);
+        for (let b = 0; b < batchSize && !state.aborted; b++) {
+          const n = idx + b + 1;
+          broadcastLog(`── [${n}/${count}] Starting vote session…`);
 
-          // Each email gets a fresh page in the same session
-          if (b > 0) {
-            page = await context.newPage();
-          }
-
-          const result = await runVoteForEmail(page, email, broadcastLog);
+          const { result, email } = await runVoteSession(context, broadcastLog);
 
           state.done++;
           if (result === 'success') {
             state.success++;
-            broadcastLog(`✅ [${state.done}/${state.total}] Vote succeeded — ${email}`);
+            broadcastLog(`✅ [${state.done}/${state.total}] Vote succeeded${email ? ` — ${email}` : ''}`);
           } else {
             state.failed++;
-            broadcastLog(`❌ [${state.done}/${state.total}] Failed (${result}) — ${email}`);
+            broadcastLog(`❌ [${state.done}/${state.total}] Failed (${result})${email ? ` — ${email}` : ''}`);
           }
+          broadcastVoteResult(email, result, result === 'success');
           broadcastStats(state.done, state.total, state.success, state.failed);
         }
       } catch (err) {
         broadcastLog(`❌ Session error: ${err}`);
-        const skipped = batch.length - (state.done - idx);
+        const skipped = batchSize - (state.done - idx);
         state.done   += skipped;
         state.failed += skipped;
         broadcastStats(state.done, state.total, state.success, state.failed);
@@ -148,10 +153,10 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
         broadcastLog('Browser closed.');
       }
 
-      idx += batch.length;
+      idx += batchSize;
 
       // Rotate Tor before the next batch
-      if (idx < emails.length && !state.aborted) {
+      if (idx < count && !state.aborted) {
         if (isTorEnabled()) {
           broadcastLog('[tor] Rotating circuit…');
           await rotateTorIP();
@@ -183,6 +188,51 @@ app.post('/api/vote/stop', (_req: Request, res: Response) => {
 
 app.get('/api/status', (_req: Request, res: Response) => {
   res.json(state);
+});
+
+/** Local only: open a visible Chromium window on the submission page for manual sign-in / vote. */
+app.post('/api/manual/open-browser', async (_req: Request, res: Response) => {
+  if (process.env.VERCEL) {
+    res.json({ ok: false, error: 'Manual browser is only available when running the app locally.' });
+    return;
+  }
+  if (state.status !== 'idle') {
+    res.json({ ok: false, error: 'Stop automated voting first.' });
+    return;
+  }
+  if (manualBrowserOpen) {
+    res.json({ ok: false, error: 'A manual browser window is already open.' });
+    return;
+  }
+
+  manualBrowserOpen = true;
+  res.json({ ok: true });
+  broadcastLog('Manual browser: opening submission page — sign in, vote, then close the window.');
+
+  (async () => {
+    let browser: Awaited<ReturnType<typeof launchSession>>['browser'] | null = null;
+    let context: Awaited<ReturnType<typeof launchSession>>['context'] | null = null;
+    try {
+      const session = await launchSession({ headless: false });
+      browser = session.browser;
+      context = session.context;
+      const { page } = session;
+      await page.goto(SUBMISSION_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await new Promise<void>(resolve => {
+        browser!.once('disconnected', () => resolve());
+      });
+    } catch (err) {
+      broadcastLog(`Manual browser error: ${err}`);
+    } finally {
+      manualBrowserOpen = false;
+      if (context) await context.close().catch(() => undefined);
+      if (browser) await browser.close().catch(() => undefined);
+      broadcastLog('Manual browser closed.');
+    }
+  })().catch(err => {
+    manualBrowserOpen = false;
+    broadcastLog(`Manual browser fatal: ${err}`);
+  });
 });
 
 // ── Start (local only — Vercel invokes the exported app directly) ──────────

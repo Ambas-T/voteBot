@@ -71,7 +71,7 @@ export interface BrowserSession {
   page: Page;
 }
 
-export async function launchSession(): Promise<BrowserSession> {
+export async function launchSession(opts?: { headless?: boolean }): Promise<BrowserSession> {
   // ── Vercel / serverless path ─────────────────────────────────────────────
   if (IS_VERCEL) {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -101,8 +101,9 @@ export async function launchSession(): Promise<BrowserSession> {
   const StealthPlugin = require('puppeteer-extra-plugin-stealth');
   chromium.use(StealthPlugin());
 
-  const headless = process.env.SHOW_BROWSER !== 'true';
-  const slowMo   = parseInt(process.env.SLOW_MO ?? '0', 10);
+  const headless =
+    opts?.headless !== undefined ? opts.headless : process.env.SHOW_BROWSER !== 'true';
+  const slowMo = parseInt(process.env.SLOW_MO ?? '0', 10);
 
   let proxyUrl: string | undefined;
   if (isTorEnabled()) {

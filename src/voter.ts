@@ -1,26 +1,32 @@
 /**
  * Core vote logic.
  *
- * Flow per email:
- *   1. Sign up on creativeaward.ai with the provided email
- *   2. Log in  (site may auto-login after signup, or we try explicitly)
- *   3. Vote / Like on the submission page
- *
- * No email-verification step — the caller supplies real emails they own.
+ * Flow per session:
+ *   1. Call mail.tm API (server-side, bypasses Tor proxy) → fresh temp email
+ *   2. Generate an Ethiopian name via Groq (or local pool)
+ *   3. Sign up on creativeaward.ai with that email  (through Tor)
+ *   4. Poll mail.tm API for the verification email, navigate to the link  (through Tor)
+ *   5. Log in (if not already logged in after verification)  (through Tor)
+ *   6. Vote on the submission page  (through Tor)
  */
 
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import type { Page } from 'playwright';
+import type { BrowserContext, Page } from 'playwright-core';
+import { generateEthiopianName } from './names';
+import { getTempMailbox, waitForVerificationLink } from './tenminute';
 
-const SIGNUP_URL     = 'https://www.creativeaward.ai/signup?callbackUrl=%2Fmy-submissions';
-const LOGIN_URL      = 'https://www.creativeaward.ai/login?callbackUrl=%2Fmy-submissions';
-const SUBMISSION_URL = 'https://www.creativeaward.ai/submission/e2efa077-c740-456d-89ef-915473b3961d';
+export const SUBMISSION_URL =
+  'https://www.creativeaward.ai/submission/e2efa077-c740-456d-89ef-915473b3961d';
+
+const SIGNUP_URL = 'https://www.creativeaward.ai/signup?callbackUrl=%2Fmy-submissions';
+const LOGIN_URL  = 'https://www.creativeaward.ai/login?callbackUrl=%2Fmy-submissions';
 
 const PASSWORD = process.env.ACCOUNT_PASSWORD?.replace(/^"|"$/g, '') ?? 'ta123#$55';
 
-/** Vercel/serverless FS is read-only except /tmp — never mkdir under cwd there. */
+// ── Screenshot helper ────────────────────────────────────────────────────────
+
 function resolveShotDir(): string {
   const candidates = process.env.VERCEL
     ? [path.join(os.tmpdir(), 'votebot-screenshots')]
@@ -29,36 +35,12 @@ function resolveShotDir(): string {
     try {
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       return dir;
-    } catch {
-      /* try next */
-    }
+    } catch { /* try next */ }
   }
   return os.tmpdir();
 }
 
 const SHOT_DIR = resolveShotDir();
-
-// ── Random name pool ────────────────────────────────────────────────────────
-
-const FIRST_NAMES = [
-  'Abebe','Tigist','Haile','Mekdes','Dawit','Selamawit','Yonas','Hiwot',
-  'Samuel','Bethlehem','Daniel','Rahel','Biruk','Liya','Solomon','Meron',
-  'Yared','Tsion','Nahom','Eden','Kidus','Sara','Abel','Martha','Natnael',
-  'Fiker','Mihret','Robel','Beza','Eyob',
-];
-
-const LAST_NAMES = [
-  'Tadesse','Bekele','Negash','Haile','Girma','Tesfaye','Alemu','Worku',
-  'Mekonnen','Gebre','Ayele','Tekle','Desta','Woldemariam','Kebede','Assefa',
-  'Tilahun','Mulugeta','Getachew','Lemma',
-];
-
-function randomName() {
-  const pick = <T>(arr: T[]) => arr[Math.floor(Math.random() * arr.length)];
-  return { firstName: pick(FIRST_NAMES), lastName: pick(LAST_NAMES) };
-}
-
-// ── Screenshot helper ───────────────────────────────────────────────────────
 
 async function snap(page: Page, label: string) {
   try {
@@ -66,7 +48,9 @@ async function snap(page: Page, label: string) {
   } catch { /* ignore */ }
 }
 
-// ── Sign up ─────────────────────────────────────────────────────────────────
+// ── Sign up ──────────────────────────────────────────────────────────────────
+
+type SignupResult = 'ok' | 'already' | 'verify-needed' | 'fail';
 
 async function signup(
   page: Page,
@@ -74,8 +58,8 @@ async function signup(
   firstName: string,
   lastName: string,
   log: (m: string) => void,
-): Promise<'ok' | 'already' | 'fail'> {
-  log(`Signing up: ${email}`);
+): Promise<SignupResult> {
+  log(`Signing up: ${email} (${firstName} ${lastName})`);
   await page.goto(SIGNUP_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
   await page.waitForTimeout(1000);
 
@@ -125,16 +109,27 @@ async function signup(
 
     await page.waitForTimeout(400);
     await page.locator('button[type="submit"], input[type="submit"]').first().click();
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(3000);
 
     const url  = page.url();
     const body = (await page.textContent('body') ?? '').toLowerCase();
 
     if (body.includes('already') || body.includes('exists') || body.includes('registered')) {
-      log('Already registered — skipping to login');
+      log('Already registered — proceeding to login');
       return 'already';
     }
-    if (!url.includes('/signup') || body.includes('verify') || body.includes('check your email')) {
+
+    // Email verification required
+    if (
+      body.includes('verify') || body.includes('check your email') ||
+      body.includes('check your inbox') || body.includes('confirmation') ||
+      body.includes('sent to') || url.includes('verify') || url.includes('check-email')
+    ) {
+      log('Email verification required — will check inbox');
+      return 'verify-needed';
+    }
+
+    if (!url.includes('/signup')) {
       log(`Signup OK → ${url}`);
       return 'ok';
     }
@@ -148,12 +143,12 @@ async function signup(
   }
 }
 
-// ── Log in ─────────────────────────────────────────────────────────────────
+// ── Log in ───────────────────────────────────────────────────────────────────
 
 async function login(page: Page, email: string, log: (m: string) => void): Promise<boolean> {
-  // If we're already logged in after signup, skip
-  if (!page.url().includes('/login') && !page.url().includes('/signup')) {
-    log('Already logged in after signup ✓');
+  const url = page.url();
+  if (!url.includes('/login') && !url.includes('/signup') && !url.includes('verify')) {
+    log('Already logged in ✓');
     return true;
   }
 
@@ -166,11 +161,11 @@ async function login(page: Page, email: string, log: (m: string) => void): Promi
     await page.locator('input[type="password"], input[name="password"]').first().fill(PASSWORD);
     await page.waitForTimeout(300);
     await page.locator('button[type="submit"], input[type="submit"]').first().click();
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(3000);
 
     if (page.url().includes('/login')) {
       await snap(page, 'login-fail');
-      log('Login failed — still on login page (email may need verification first)');
+      log('Login failed — still on login page');
       return false;
     }
     log('Logged in ✓');
@@ -181,12 +176,12 @@ async function login(page: Page, email: string, log: (m: string) => void): Promi
   }
 }
 
-// ── Vote ───────────────────────────────────────────────────────────────────
+// ── Vote ─────────────────────────────────────────────────────────────────────
 
 async function vote(page: Page, log: (m: string) => void): Promise<boolean> {
   log('Navigating to submission…');
   await page.goto(SUBMISSION_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(2000);
 
   try {
     const sels = [
@@ -231,32 +226,78 @@ async function vote(page: Page, log: (m: string) => void): Promise<boolean> {
   }
 }
 
-// ── Public API ─────────────────────────────────────────────────────────────
+// ── Public API ────────────────────────────────────────────────────────────────
 
-export type VoteResult = 'success' | 'fail-signup' | 'fail-login' | 'fail-vote' | 'error';
+export type VoteResult =
+  | 'success'
+  | 'fail-email'
+  | 'fail-signup'
+  | 'fail-verify'
+  | 'fail-login'
+  | 'fail-vote'
+  | 'error';
 
 /**
- * Run the full flow for a single provided email address.
- * Uses the already-opened `page` (launched by the caller with Tor proxy).
+ * Run a full vote session.
+ * Creates its own pages inside `context` and closes them when done.
+ * Returns the email used (or empty string on early failure) alongside the result.
  */
-export async function runVoteForEmail(
-  page: Page,
-  email: string,
+export async function runVoteSession(
+  context: BrowserContext,
   log: (m: string) => void,
-): Promise<VoteResult> {
+): Promise<{ result: VoteResult; email: string }> {
+  const pages: Page[] = [];
+
+  async function newPage() {
+    const p = await context.newPage();
+    pages.push(p);
+    return p;
+  }
+
   try {
-    const { firstName, lastName } = randomName();
+    // 1. Get temp mailbox via mail.tm API — server-side, never touches the Tor proxy
+    let mailbox: Awaited<ReturnType<typeof getTempMailbox>>;
+    try {
+      mailbox = await getTempMailbox(log);
+    } catch (err) {
+      log(`Failed to get temp email: ${err}`);
+      return { result: 'fail-email', email: '' };
+    }
+    const email = mailbox.address;
 
-    const signupResult = await signup(page, email, firstName, lastName, log);
-    if (signupResult === 'fail') return 'fail-signup';
+    // 2. Generate Ethiopian name
+    const { firstName, lastName } = await generateEthiopianName(log);
 
-    const loggedIn = await login(page, email, log);
-    if (!loggedIn) return 'fail-login';
+    // 3. Sign up on creativeaward.ai  (goes through Tor when TOR_ENABLED=true)
+    const mainPage = await newPage();
+    const signupResult = await signup(mainPage, email, firstName, lastName, log);
+    if (signupResult === 'fail') return { result: 'fail-signup', email };
 
-    const voted = await vote(page, log);
-    return voted ? 'success' : 'fail-vote';
+    // 4. Poll mail.tm inbox for verification link — server-side, no Tor proxy involved
+    if (signupResult === 'verify-needed') {
+      log('Polling mail.tm inbox for verification link…');
+      const verifyLink = await waitForVerificationLink(mailbox, log);
+      if (!verifyLink) {
+        log('No verification link received — aborting');
+        return { result: 'fail-verify', email };
+      }
+      log('Navigating to verification link…');
+      await mainPage.goto(verifyLink, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await mainPage.waitForTimeout(2000);
+      log('Email verified ✓');
+    }
+
+    // 5. Log in
+    const loggedIn = await login(mainPage, email, log);
+    if (!loggedIn) return { result: 'fail-login', email };
+
+    // 6. Vote
+    const voted = await vote(mainPage, log);
+    return { result: voted ? 'success' : 'fail-vote', email };
   } catch (err) {
     log(`Unhandled error: ${err}`);
-    return 'error';
+    return { result: 'error', email: '' };
+  } finally {
+    for (const p of pages) await p.close().catch(() => undefined);
   }
 }

@@ -7,5 +7,10 @@
       "maxDuration": 300,
       "includeFiles": "ui/**"
     }
+  },
+  "build": {
+    "env": {
+      "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1"
+    }
   }
 }
