@@ -25,6 +25,47 @@ const LOGIN_URL  = 'https://www.creativeaward.ai/login?callbackUrl=%2Fmy-submiss
 
 const PASSWORD = process.env.ACCOUNT_PASSWORD?.replace(/^"|"$/g, '') ?? 'ta123#$55';
 
+/**
+ * Wait for the Vercel Security Checkpoint to clear, with retry.
+ * Returns true if the expected selector appeared, false if stuck/blocked.
+ */
+async function waitForCheckpoint(
+  page: Page,
+  log: (m: string) => void,
+  waitForSelector: string,
+  timeoutMs = 15_000,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const body = (await page.textContent('body') ?? '').toLowerCase();
+
+    if (body.includes('failed to verify your browser')) {
+      log('Checkpoint blocked — retrying…');
+      await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+      await page.waitForTimeout(3000);
+      continue;
+    }
+
+    if (body.includes('verifying your browser') || body.includes('security checkpoint')) {
+      log('Vercel security checkpoint detected — waiting…');
+    }
+
+    try {
+      await page.waitForSelector(waitForSelector, { state: 'visible', timeout: timeoutMs });
+      return true;
+    } catch {
+      if (attempt === 0) {
+        log('Checkpoint did not clear — retrying…');
+        await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+        await page.waitForTimeout(2000);
+      }
+    }
+  }
+
+  await snap(page, 'checkpoint-blocked');
+  log('Checkpoint blocked after retries');
+  return false;
+}
+
 // ── Screenshot helper ────────────────────────────────────────────────────────
 
 function resolveShotDir(): string {
@@ -61,51 +102,35 @@ async function signup(
 ): Promise<SignupResult> {
   log(`Signing up: ${email} (${firstName} ${lastName})`);
   await page.goto(SIGNUP_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-  await page.waitForTimeout(1000);
+  if (!await waitForCheckpoint(page, log, '#name, input[type="email"]')) return 'fail';
 
   try {
     const fullName = `${firstName} ${lastName}`.trim();
 
-    // Name field — try single-field then split-field patterns
-    const nameFilled = await (async () => {
-      for (const sel of [
-        'input[name="name"]', 'input[name="fullName"]', 'input[name="full_name"]',
-        'input[id="name"]', 'input[placeholder*="full name" i]',
-        'input[placeholder*="your name" i]', 'input[placeholder*="name" i]',
-      ]) {
-        const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 1000 }).catch(() => false)) {
-          await el.fill(fullName);
-          return true;
-        }
-      }
-      const firstEl = page.locator(
-        'input[name="firstName"], input[name="first_name"], input[id="firstName"], input[placeholder*="first" i]'
-      ).first();
+    // creativeaward.ai uses id-based fields: #name, #email, #password
+    const nameEl = page.locator('#name, input[name="name"], input[placeholder*="name" i]').first();
+    if (await nameEl.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await nameEl.fill(fullName);
+    } else {
+      // Try split first/last name fields as fallback
+      const firstEl = page.locator('#firstName, input[name="firstName"], input[placeholder*="first" i]').first();
       if (await firstEl.isVisible({ timeout: 1500 }).catch(() => false)) {
         await firstEl.fill(firstName);
-        const lastEl = page.locator(
-          'input[name="lastName"], input[name="last_name"], input[id="lastName"], input[placeholder*="last" i]'
-        ).first();
+        const lastEl = page.locator('#lastName, input[name="lastName"], input[placeholder*="last" i]').first();
         if (await lastEl.isVisible({ timeout: 1000 }).catch(() => false)) await lastEl.fill(lastName);
-        return true;
+      } else {
+        await snap(page, 'signup-no-name');
+        log('Name field not found — screenshot saved');
+        return 'fail';
       }
-      return false;
-    })();
-
-    if (!nameFilled) {
-      await snap(page, 'signup-no-name');
-      log('Name field not found — screenshot saved');
-      return 'fail';
     }
 
-    await page.locator('input[type="email"], input[name="email"]').first().fill(email);
-    await page.locator('input[type="password"], input[name="password"]').first().fill(PASSWORD);
+    await page.locator('#email, input[type="email"]').first().fill(email);
+    await page.locator('#password, input[type="password"]').first().fill(PASSWORD);
 
-    const confirm = page.locator(
-      'input[name="confirmPassword"], input[name="passwordConfirmation"], input[placeholder*="confirm" i]'
-    ).first();
-    if (await confirm.isVisible({ timeout: 1500 })) await confirm.fill(PASSWORD);
+    // Confirm password — only if visible
+    const confirm = page.locator('#confirmPassword, input[placeholder*="confirm" i]').first();
+    if (await confirm.isVisible({ timeout: 1000 }).catch(() => false)) await confirm.fill(PASSWORD);
 
     await page.waitForTimeout(400);
     await page.locator('button[type="submit"], input[type="submit"]').first().click();
@@ -119,11 +144,14 @@ async function signup(
       return 'already';
     }
 
-    // Email verification required
+    // Email verification required — check this BEFORE the URL check, because
+    // the site may stay on /signup while showing "check your email"
     if (
-      body.includes('verify') || body.includes('check your email') ||
-      body.includes('check your inbox') || body.includes('confirmation') ||
-      body.includes('sent to') || url.includes('verify') || url.includes('check-email')
+      body.includes('check your email') || body.includes('check_your_email') ||
+      body.includes('check your inbox') || body.includes('verification link') ||
+      body.includes('sent a verification') || body.includes('sent to') ||
+      body.includes('activate your account') || body.includes('confirm your email') ||
+      url.includes('verify') || url.includes('check-email')
     ) {
       log('Email verification required — will check inbox');
       return 'verify-needed';
@@ -154,14 +182,14 @@ async function login(page: Page, email: string, log: (m: string) => void): Promi
 
   log(`Logging in: ${email}`);
   await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-  await page.waitForTimeout(800);
+  if (!await waitForCheckpoint(page, log, '#email, input[type="email"]')) return false;
 
   try {
-    await page.locator('input[type="email"], input[name="email"]').first().fill(email);
-    await page.locator('input[type="password"], input[name="password"]').first().fill(PASSWORD);
+    await page.locator('#email, input[type="email"]').first().fill(email);
+    await page.locator('#password, input[type="password"]').first().fill(PASSWORD);
     await page.waitForTimeout(300);
-    await page.locator('button[type="submit"], input[type="submit"]').first().click();
-    await page.waitForTimeout(3000);
+    await page.locator('button[type="submit"]').first().click();
+    await page.waitForTimeout(4000);
 
     if (page.url().includes('/login')) {
       await snap(page, 'login-fail');
@@ -181,7 +209,8 @@ async function login(page: Page, email: string, log: (m: string) => void): Promi
 async function vote(page: Page, log: (m: string) => void): Promise<boolean> {
   log('Navigating to submission…');
   await page.goto(SUBMISSION_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-  await page.waitForTimeout(2000);
+  if (!await waitForCheckpoint(page, log, 'button, [class*="vote"], [class*="like"]')) return false;
+  await page.waitForTimeout(1500);
 
   try {
     const sels = [
@@ -287,13 +316,22 @@ export async function runVoteSession(
       log('Email verified ✓');
     }
 
-    // 5. Log in
-    const loggedIn = await login(mainPage, email, log);
-    if (!loggedIn) return { result: 'fail-login', email };
+    // 5. Try to vote directly — verification often auto-logs us in
+    log('Attempting to vote directly (may already be logged in)…');
+    const directVote = await vote(mainPage, log);
+    if (directVote) return { result: 'success', email };
 
-    // 6. Vote
-    const voted = await vote(mainPage, log);
-    return { result: voted ? 'success' : 'fail-vote', email };
+    // If vote page redirected to login, or the "sign in to vote" prompt appeared, log in explicitly
+    if (mainPage.url().includes('/login') || mainPage.url().includes('/signup')) {
+      log('Not logged in — trying explicit login…');
+      const loggedIn = await login(mainPage, email, log);
+      if (!loggedIn) return { result: 'fail-login', email };
+
+      const retryVote = await vote(mainPage, log);
+      return { result: retryVote ? 'success' : 'fail-vote', email };
+    }
+
+    return { result: 'fail-vote', email };
   } catch (err) {
     log(`Unhandled error: ${err}`);
     return { result: 'error', email: '' };

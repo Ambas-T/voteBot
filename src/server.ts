@@ -35,7 +35,10 @@ function broadcast(type: string, payload: object) {
   sseClients.forEach(c => { try { c.write(data); } catch { /* ignore */ } });
 }
 
-function broadcastLog(msg: string)                    { broadcast('log',    { message: msg }); }
+function broadcastLog(msg: string) {
+  console.log(msg);
+  broadcast('log', { message: msg });
+}
 function broadcastStatus(status: string)              { broadcast('status', { status }); }
 function broadcastStats(done: number, total: number, success: number, failed: number) {
   broadcast('stats', { done, total, success, failed });
