@@ -1,0 +1,30 @@
+{
+  "name": "votebot",
+  "version": "1.0.0",
+  "description": "Automated voting bot with web UI — paste emails, vote via Tor",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "ts-node src/index.ts",
+    "build": "tsc",
+    "start:prod": "npm run build && node dist/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@sparticuz/chromium": "^143.0.4",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "playwright": "^1.58.2",
+    "playwright-core": "^1.58.2",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.5.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
