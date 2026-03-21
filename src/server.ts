@@ -22,9 +22,10 @@ import { runVoteSession, SUBMISSION_URL } from './voter';
 const app  = express();
 const PORT = parseInt(process.env.UI_PORT ?? '3000', 10);
 
-const VOTES_PER_SESSION = parseInt(process.env.VOTES_PER_SESSION ?? '1', 10);
+const VOTES_PER_SESSION  = parseInt(process.env.VOTES_PER_SESSION ?? '3', 10);
+const PARALLEL_BROWSERS  = parseInt(process.env.PARALLEL_BROWSERS ?? '5', 10);
 const PROXY_MODE = (process.env.PROXY_MODE ?? '').trim().toLowerCase() || (isTorEnabled() ? 'tor' : 'none');
-console.log(`[config] PROXY_MODE=${PROXY_MODE}  VOTES_PER_SESSION=${VOTES_PER_SESSION}`);
+console.log(`[config] PROXY_MODE=${PROXY_MODE}  VOTES_PER_SESSION=${VOTES_PER_SESSION}  PARALLEL=${PARALLEL_BROWSERS}`);
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'ui')));
@@ -95,7 +96,7 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
   const count    = Number.isFinite(rawCount) && rawCount > 0 ? Math.min(rawCount, 3000) : 0;
 
   if (count === 0) {
-    res.json({ ok: false, error: 'Provide count (1–100)' });
+    res.json({ ok: false, error: 'Provide count (1–3000)' });
     return;
   }
 
@@ -112,101 +113,70 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
 
   res.json({ ok: true, count });
 
-  // ── Background loop ──────────────────────────────────────────────────────
+  // ── Parallel worker pool ─────────────────────────────────────────────────
   (async () => {
-    let successInBatch = 0;
-    let consecutiveFails = 0;
-
-    async function rotateCircuit() {
-      if (PROXY_MODE === 'tor') {
-        broadcastLog('[tor] Rotating circuit…');
-        const ok = await rotateTorIP(broadcastLog);
-        if (!ok) broadcastLog('[tor] ⚠ Rotation failed — will continue with current circuit');
-        broadcastLog('[tor] Waiting 10s for new circuit…');
-        await waitForNewCircuit(10_000);
-        broadcastLog('[tor] Ready.');
-      } else if (PROXY_MODE === 'proxies') {
-        // Each browser launch picks the next proxy — just a short cooldown
-        await new Promise(r => setTimeout(r, 1500));
-      } else {
-        await new Promise(r => setTimeout(r, 2000));
-      }
+    // Shared counter — each worker claims votes atomically
+    let nextVote = 0;
+    function claimVote(): number | null {
+      if (nextVote >= count || state.aborted) return null;
+      return nextVote++;
     }
 
-    while (state.done < count && !state.aborted) {
-      const remaining = count - state.done;
-      const batchSize = Math.min(VOTES_PER_SESSION, remaining);
-      broadcastLog(`\n━━ Opening browser for ${batchSize} vote(s)…`);
+    /** Single worker: opens a browser, runs up to VOTES_PER_SESSION votes, closes browser, repeats. */
+    async function worker(workerId: number) {
+      while (!state.aborted) {
+        const firstVote = claimVote();
+        if (firstVote === null) return;
 
-      let browser: Awaited<ReturnType<typeof launchSession>>['browser'] | null = null;
-      let context: Awaited<ReturnType<typeof launchSession>>['context'] | null = null;
-      successInBatch = 0;
+        const batchSize = Math.min(VOTES_PER_SESSION, count - firstVote);
+        broadcastLog(`[W${workerId}] Opening browser for ${batchSize} vote(s)…`);
 
-      try {
-        const session = await launchSession();
-        browser = session.browser;
-        context = session.context;
+        let browser: Awaited<ReturnType<typeof launchSession>>['browser'] | null = null;
+        let context: Awaited<ReturnType<typeof launchSession>>['context'] | null = null;
 
-        // Quick IP check to verify proxy is working
-        if (PROXY_MODE !== 'none') {
-          try {
-            await session.page.goto('https://api.ipify.org/', { waitUntil: 'domcontentloaded', timeout: 10_000 });
-            const ip = (await session.page.textContent('body') ?? '').trim();
-            if (ip) broadcastLog(`[${PROXY_MODE}] IP: ${ip}`);
-          } catch { /* non-fatal */ }
-        }
-        await session.page.close().catch(() => undefined);
+        try {
+          const session = await launchSession();
+          browser = session.browser;
+          context = session.context;
+          await session.page.close().catch(() => undefined);
 
-        for (let b = 0; b < batchSize && !state.aborted; b++) {
-          broadcastLog(`── [${state.done + 1}/${count}] Starting vote session…`);
+          for (let b = 0; b < batchSize && !state.aborted; b++) {
+            // Claim this vote slot (first one was already claimed above)
+            if (b > 0 && claimVote() === null) break;
 
-          const { result, email } = await runVoteSession(context, broadcastLog);
+            const voteNum = state.done + 1;
+            broadcastLog(`[W${workerId}] ── [${voteNum}/${count}] Starting vote…`);
 
-          state.done++;
-          if (result === 'success') {
-            state.success++;
-            successInBatch++;
-            consecutiveFails = 0;
-            broadcastLog(`✅ [${state.done}/${state.total}] Vote succeeded${email ? ` — ${email}` : ''}`);
-            // Brief cooldown between successful votes to avoid signup rate limits
-            if (state.done < count) {
-              broadcastLog('Cooling down 5s before next vote…');
-              await new Promise(r => setTimeout(r, 5000));
+            const { result, email } = await runVoteSession(context, (msg) =>
+              broadcastLog(`[W${workerId}] ${msg}`),
+            );
+
+            state.done++;
+            if (result === 'success') {
+              state.success++;
+              broadcastLog(`[W${workerId}] ✅ [${state.done}/${count}] Vote succeeded${email ? ` — ${email}` : ''}`);
+            } else {
+              state.failed++;
+              broadcastLog(`[W${workerId}] ❌ [${state.done}/${count}] Failed (${result})${email ? ` — ${email}` : ''}`);
             }
-          } else {
-            state.failed++;
-            consecutiveFails++;
-            broadcastLog(`❌ [${state.done}/${state.total}] Failed (${result})${email ? ` — ${email}` : ''}`);
-
-            if (result === 'fail-signup' && consecutiveFails <= 3) {
-              // Signup rejection = likely rate-limited; wait longer before retrying
-              broadcastLog('Signup rate-limited — waiting 15s before retry…');
-              await new Promise(r => setTimeout(r, 15_000));
-            } else if (consecutiveFails >= 3) {
-              broadcastLog('3 consecutive failures — rotating proxy');
-              break;
-            }
+            broadcastVoteResult(email, result, result === 'success');
+            broadcastStats(state.done, state.total, state.success, state.failed);
           }
-          broadcastVoteResult(email, result, result === 'success');
+        } catch (err) {
+          broadcastLog(`[W${workerId}] ❌ Session error: ${err}`);
+          state.done++;
+          state.failed++;
           broadcastStats(state.done, state.total, state.success, state.failed);
+        } finally {
+          if (context) await context.close().catch(() => undefined);
+          if (browser) await browser.close().catch(() => undefined);
         }
-      } catch (err) {
-        broadcastLog(`❌ Session error: ${err}`);
-        state.done++;
-        state.failed++;
-        consecutiveFails++;
-        broadcastStats(state.done, state.total, state.success, state.failed);
-      } finally {
-        if (context) await context.close().catch(() => undefined);
-        if (browser) await browser.close().catch(() => undefined);
-        broadcastLog('Browser closed.');
-      }
-
-      // Rotate Tor circuit before the next batch
-      if (state.done < count && !state.aborted) {
-        await rotateCircuit();
       }
     }
+
+    broadcastLog(`Launching ${PARALLEL_BROWSERS} parallel workers (${VOTES_PER_SESSION} votes/browser)…`);
+    const workers = Array.from({ length: PARALLEL_BROWSERS }, (_, i) => worker(i + 1));
+    await Promise.all(workers);
 
     if (state.aborted) broadcastLog('🛑 Stopped by user.');
     broadcastLog(`\n══ Done ══  ✅ ${state.success} succeeded   ❌ ${state.failed} failed`);

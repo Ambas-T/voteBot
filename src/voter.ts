@@ -114,7 +114,7 @@ async function signup(
   log: (m: string) => void,
 ): Promise<SignupResult> {
   log(`Signing up: ${email} (${firstName} ${lastName})`);
-  await page.goto(SIGNUP_URL, { waitUntil: 'load', timeout: 30_000 });
+  await page.goto(SIGNUP_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
   if (!await waitForCheckpoint(page, log, '#name, input[type="email"]')) return 'fail';
 
   try {
@@ -215,7 +215,7 @@ async function login(page: Page, email: string, log: (m: string) => void): Promi
   }
 
   log(`Logging in: ${email}`);
-  await page.goto(LOGIN_URL, { waitUntil: 'load', timeout: 30_000 });
+  await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
   if (!await waitForCheckpoint(page, log, '#email, input[type="email"]')) return false;
 
   try {
@@ -242,7 +242,7 @@ async function login(page: Page, email: string, log: (m: string) => void): Promi
 
 async function vote(page: Page, log: (m: string) => void): Promise<boolean> {
   log('Navigating to submission…');
-  await page.goto(SUBMISSION_URL, { waitUntil: 'load', timeout: 30_000 });
+  await page.goto(SUBMISSION_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
   if (!await waitForCheckpoint(page, log, 'main, button')) return false;
   await page.waitForTimeout(2000);
 
@@ -381,7 +381,12 @@ export async function runVoteSession(
         return { result: 'fail-verify', email };
       }
       log('Navigating to verification link…');
-      await mainPage.goto(verifyLink, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      try {
+        await mainPage.goto(verifyLink, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      } catch (navErr) {
+        log(`Verification navigation failed: ${navErr}`);
+        return { result: 'fail-verify', email };
+      }
       await mainPage.waitForTimeout(3000);
 
       // The verification redirect may pass through resend-links.com → creativeaward.ai
