@@ -38,51 +38,45 @@ function isUnhydratedPage(body: string): boolean {
 }
 
 /**
- * Wait for the Vercel Security Checkpoint to clear, with retry.
- * Returns true if the expected selector appeared, false if stuck/blocked.
+ * Wait for a Next.js page to hydrate and the expected element to appear.
+ * The page HTML loads instantly (SSR shell) but React bundles take several
+ * seconds to download + execute. Wait for the target selector first; only
+ * diagnose blocks if it never appears.
  */
 async function waitForCheckpoint(
   page: Page,
   log: (m: string) => void,
   waitForSelector: string,
-  timeoutMs = 15_000,
+  timeoutMs = 20_000,
 ): Promise<boolean> {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const body = (await page.textContent('body') ?? '').toLowerCase();
+  // Give React time to hydrate — wait for the target element directly.
+  try {
+    await page.waitForSelector(waitForSelector, { state: 'visible', timeout: timeoutMs });
+    return true;
+  } catch {
+    // Selector didn't appear — diagnose the failure
+    const body = (await page.innerText('body').catch(() => '')).toLowerCase();
+    await snap(page, 'checkpoint-timeout');
 
-    if (isUnhydratedPage(body)) {
-      log(`Page not hydrated (attempt ${attempt + 1}/3) — reloading…`);
-      await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
-      await page.waitForTimeout(4000);
-      continue;
+    if (body.includes('failed to verify') || body.includes('security checkpoint') || body.includes('code 21')) {
+      log('Vercel checkpoint blocked this IP');
+      return false;
     }
-
-    if (body.includes('failed to verify your browser')) {
-      log('Checkpoint blocked — retrying…');
-      await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
-      await page.waitForTimeout(3000);
-      continue;
-    }
-
-    if (body.includes('verifying your browser') || body.includes('security checkpoint')) {
-      log('Vercel security checkpoint detected — waiting…');
-    }
-
-    try {
-      await page.waitForSelector(waitForSelector, { state: 'visible', timeout: timeoutMs });
-      return true;
-    } catch {
-      if (attempt < 2) {
-        log('Target selector not visible — retrying…');
-        await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
-        await page.waitForTimeout(2000);
+    if (body.includes('verifying your browser')) {
+      log('Checkpoint still verifying — waiting 8s more…');
+      await page.waitForTimeout(8000);
+      try {
+        await page.waitForSelector(waitForSelector, { state: 'visible', timeout: 10_000 });
+        return true;
+      } catch {
+        log('Still not visible after extended wait');
+        return false;
       }
     }
-  }
 
-  await snap(page, 'checkpoint-blocked');
-  log('Checkpoint blocked after retries');
-  return false;
+    log(`Page did not render target element — body(100): "${body.slice(0, 100).replace(/\n/g, ' ')}"`);
+    return false;
+  }
 }
 
 // ── Screenshot helper ────────────────────────────────────────────────────────
@@ -120,7 +114,7 @@ async function signup(
   log: (m: string) => void,
 ): Promise<SignupResult> {
   log(`Signing up: ${email} (${firstName} ${lastName})`);
-  await page.goto(SIGNUP_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await page.goto(SIGNUP_URL, { waitUntil: 'load', timeout: 30_000 });
   if (!await waitForCheckpoint(page, log, '#name, input[type="email"]')) return 'fail';
 
   try {
@@ -156,34 +150,38 @@ async function signup(
     await page.waitForTimeout(4000);
 
     const url  = page.url();
-    const body = (await page.textContent('body') ?? '').toLowerCase();
+    const body = (await page.innerText('body').catch(() => '')).toLowerCase();
+    log(`[signup-debug] url=${url}  body(100)="${body.slice(0, 100).replace(/\n/g, ' ')}"`);
 
-    // If the response page is just the Next.js inline script (React didn't hydrate),
-    // the Vercel checkpoint is blocking this exit IP.
     if (isUnhydratedPage(body)) {
       await snap(page, 'signup-blocked');
       log('Signup response blocked — page did not hydrate (Vercel checkpoint)');
       return 'fail';
     }
 
+    // Match the actual creativeaward.ai "Check Your Email" page (most common success)
     if (
       body.includes('check your email') || body.includes('check_your_email') ||
       body.includes('check your inbox') || body.includes('verification link') ||
       body.includes('sent a verification') || body.includes('sent to') ||
       body.includes('activate your account') || body.includes('confirm your email') ||
+      body.includes('we sent') ||
       url.includes('verify') || url.includes('check-email')
     ) {
       log('Email verification required — will check inbox');
       return 'verify-needed';
     }
 
-    if (
-      body.includes('already registered') || body.includes('already exists') ||
-      body.includes('already in use') || body.includes('email exists') ||
-      body.includes('account exists') || body.includes('email already')
-    ) {
+    // Only flag "already registered" for very specific server-error patterns.
+    // Must NOT match generic page chrome like "Already have an account? Sign in"
+    const alreadyPatterns = [
+      'already registered', 'already exists', 'already in use',
+      'email exists', 'account exists', 'email already',
+      'already been registered', 'email is taken',
+    ];
+    if (alreadyPatterns.some(p => body.includes(p))) {
       await snap(page, 'signup-already');
-      log(`Already registered — body snippet: ${body.slice(0, 200)}`);
+      log(`Already registered — body: ${body.slice(0, 300)}`);
       return 'already';
     }
 
@@ -193,7 +191,7 @@ async function signup(
     }
 
     await snap(page, 'signup-fail');
-    log(`Signup may have failed — URL: ${url} — body: ${body.slice(0, 200)}`);
+    log(`Signup may have failed — URL: ${url} — body: ${body.slice(0, 300)}`);
     return 'fail';
   } catch (err) {
     log(`Signup error: ${err}`);
@@ -211,7 +209,7 @@ async function login(page: Page, email: string, log: (m: string) => void): Promi
   }
 
   log(`Logging in: ${email}`);
-  await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await page.goto(LOGIN_URL, { waitUntil: 'load', timeout: 30_000 });
   if (!await waitForCheckpoint(page, log, '#email, input[type="email"]')) return false;
 
   try {
@@ -238,7 +236,7 @@ async function login(page: Page, email: string, log: (m: string) => void): Promi
 
 async function vote(page: Page, log: (m: string) => void): Promise<boolean> {
   log('Navigating to submission…');
-  await page.goto(SUBMISSION_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await page.goto(SUBMISSION_URL, { waitUntil: 'load', timeout: 30_000 });
   if (!await waitForCheckpoint(page, log, 'main, button')) return false;
   await page.waitForTimeout(2000);
 
@@ -386,7 +384,7 @@ export async function runVoteSession(
       log(`After verification → ${verifyUrl}`);
 
       // Check if we landed on a page that requires further action
-      const verifyBody = (await mainPage.textContent('body') ?? '').toLowerCase();
+      const verifyBody = (await mainPage.innerText('body').catch(() => '')).toLowerCase();
       if (verifyBody.includes('verified') || verifyBody.includes('success') || verifyBody.includes('confirmed')) {
         log('Email verified ✓');
       } else {

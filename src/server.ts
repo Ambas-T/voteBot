@@ -16,14 +16,15 @@ import express from 'express';
 import path from 'path';
 import type { Request, Response } from 'express';
 import { launchSession } from './browser';
-import { isTorEnabled, rotateTorIP, waitForNewCircuit, checkTorIP } from './tor';
+import { isTorEnabled, rotateTorIP, waitForNewCircuit } from './tor';
 import { runVoteSession, SUBMISSION_URL } from './voter';
 
 const app  = express();
 const PORT = parseInt(process.env.UI_PORT ?? '3000', 10);
 
-const VOTES_PER_SESSION = parseInt(process.env.VOTES_PER_SESSION ?? '3', 10);
-console.log(`[config] VOTES_PER_SESSION=${VOTES_PER_SESSION}  TOR_ENABLED=${isTorEnabled()}  (raw: "${process.env.TOR_ENABLED}")`);
+const VOTES_PER_SESSION = parseInt(process.env.VOTES_PER_SESSION ?? '1', 10);
+const PROXY_MODE = (process.env.PROXY_MODE ?? '').trim().toLowerCase() || (isTorEnabled() ? 'tor' : 'none');
+console.log(`[config] PROXY_MODE=${PROXY_MODE}  VOTES_PER_SESSION=${VOTES_PER_SESSION}`);
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'ui')));
@@ -117,17 +118,17 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
     let consecutiveFails = 0;
 
     async function rotateCircuit() {
-      if (isTorEnabled()) {
+      if (PROXY_MODE === 'tor') {
         broadcastLog('[tor] Rotating circuit…');
         const ok = await rotateTorIP(broadcastLog);
-        if (!ok) {
-          broadcastLog('[tor] ⚠ Rotation failed — will continue with current circuit');
-        }
-        broadcastLog('[tor] Waiting 15s for new circuit…');
-        await waitForNewCircuit(15_000);
-        broadcastLog('[tor] Ready — opening next batch.');
+        if (!ok) broadcastLog('[tor] ⚠ Rotation failed — will continue with current circuit');
+        broadcastLog('[tor] Waiting 10s for new circuit…');
+        await waitForNewCircuit(10_000);
+        broadcastLog('[tor] Ready.');
+      } else if (PROXY_MODE === 'proxies') {
+        // Each browser launch picks the next proxy — just a short cooldown
+        await new Promise(r => setTimeout(r, 1500));
       } else {
-        broadcastLog('[tor] Tor not enabled — pausing 2s between batches');
         await new Promise(r => setTimeout(r, 2000));
       }
     }
@@ -146,12 +147,12 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
         browser = session.browser;
         context = session.context;
 
-        // Quick exit-IP check so we can verify rotation is working
-        if (isTorEnabled()) {
+        // Quick IP check to verify proxy is working
+        if (PROXY_MODE !== 'none') {
           try {
-            await session.page.goto('https://api.ipify.org/', { waitUntil: 'domcontentloaded', timeout: 15_000 });
+            await session.page.goto('https://api.ipify.org/', { waitUntil: 'domcontentloaded', timeout: 10_000 });
             const ip = (await session.page.textContent('body') ?? '').trim();
-            if (ip) broadcastLog(`[tor] Exit IP: ${ip}`);
+            if (ip) broadcastLog(`[${PROXY_MODE}] IP: ${ip}`);
           } catch { /* non-fatal */ }
         }
         await session.page.close().catch(() => undefined);
