@@ -20,7 +20,7 @@ import { isTorEnabled, rotateTorIP, waitForNewCircuit } from './tor';
 import { runVoteSession, SUBMISSION_URL } from './voter';
 
 const app  = express();
-const PORT = parseInt(process.env.UI_PORT ?? '3000', 10);
+const PORT = parseInt(process.env.PORT ?? process.env.UI_PORT ?? '3000', 10);
 
 const VOTES_PER_SESSION  = parseInt(process.env.VOTES_PER_SESSION ?? '3', 10);
 const PARALLEL_BROWSERS  = parseInt(process.env.PARALLEL_BROWSERS ?? '5', 10);
@@ -221,7 +221,7 @@ app.get('/api/status', (_req: Request, res: Response) => {
 
 /** Local only: open a visible Chromium window on the submission page for manual sign-in / vote. */
 app.post('/api/manual/open-browser', async (_req: Request, res: Response) => {
-  if (process.env.VERCEL) {
+  if (process.env.VERCEL || process.env.RAILWAY_ENVIRONMENT) {
     res.json({ ok: false, error: 'Manual browser is only available when running the app locally.' });
     return;
   }

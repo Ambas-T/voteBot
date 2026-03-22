@@ -4,9 +4,10 @@
   "description": "Automated voting bot with web UI — paste emails, vote via Tor",
   "main": "dist/api/index.js",
   "scripts": {
-    "start": "ts-node src/index.ts",
+    "dev": "ts-node src/index.ts",
+    "start": "node dist/api/index.js",
     "build": "tsc",
-    "start:prod": "npm run build && node dist/api/index.js"
+    "start:prod": "npm run build && npm start"
   },
   "keywords": [],
   "author": "",
