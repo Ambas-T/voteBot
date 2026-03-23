@@ -1,7 +1,6 @@
 /**
- * Vercel serverless entry — re-exports the Express app.
- * `vercel.json` rewrites all routes here; Express still handles `/api/*` and static `ui/`.
+ * Production entry point — imports the Express server.
+ * Railway runs: npm run build && npm start (node dist/api/index.js)
+ * The server module handles listening when not in serverless (Vercel) mode.
  */
-import app from '../src/server';
-
-export default app;
+import '../src/server';
