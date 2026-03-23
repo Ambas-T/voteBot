@@ -365,7 +365,21 @@ export async function runVoteSession(
     // 0. Clear previous session so signup page renders fresh
     await context.clearCookies();
 
-    // 1. Get temp mailbox via mail.tm API — server-side, never touches the Tor proxy
+    // 1. Probe proxy connectivity before wasting email/name resources
+    const probePage = await newPage();
+    try {
+      await probePage.goto('https://www.creativeaward.ai/login', {
+        waitUntil: 'domcontentloaded',
+        timeout: 15_000,
+      });
+    } catch (probeErr) {
+      log(`Proxy dead — ${(probeErr as Error).message?.split('\n')[0] ?? probeErr}`);
+      return { result: 'fail-signup', email: '' };
+    }
+    await probePage.close().catch(() => undefined);
+    pages.length = 0;
+
+    // 2. Get temp mailbox — server-side, never touches the proxy
     let mailbox: Awaited<ReturnType<typeof getTempMailbox>>;
     try {
       mailbox = await getTempMailbox(log);
@@ -375,15 +389,15 @@ export async function runVoteSession(
     }
     const email = mailbox.address;
 
-    // 2. Generate Ethiopian name
+    // 3. Generate Ethiopian name
     const { firstName, lastName } = await generateEthiopianName(log);
 
-    // 3. Sign up on creativeaward.ai  (goes through Tor when TOR_ENABLED=true)
+    // 4. Sign up on creativeaward.ai
     const mainPage = await newPage();
     const signupResult = await signup(mainPage, email, firstName, lastName, log);
     if (signupResult === 'fail') return { result: 'fail-signup', email };
 
-    // 4. Poll 10minutemail inbox for verification link — server-side, no Tor proxy involved
+    // 5. Poll 10minutemail inbox for verification link — server-side, no Tor proxy involved
     if (signupResult === 'verify-needed') {
       log('Polling 10minutemail inbox for verification link…');
       const verifyLink = await waitForVerificationLink(mailbox, log);
@@ -414,19 +428,19 @@ export async function runVoteSession(
       }
     }
 
-    // 5. Log in explicitly — even if verification redirected us, we need a
+    // 6. Log in explicitly — even if verification redirected us, we need a
     //    proper session. The vote button is disabled without auth.
     const loggedIn = await login(mainPage, email, log);
     if (!loggedIn) {
       log('Login failed — trying to vote anyway in case we have a session…');
     }
 
-    // 6. Ensure we're on creativeaward.ai before voting (needed for API fetch)
+    // 7. Ensure we're on creativeaward.ai before voting (needed for API fetch)
     if (!mainPage.url().includes('creativeaward.ai')) {
       await mainPage.goto('https://www.creativeaward.ai/', { waitUntil: 'domcontentloaded', timeout: 30_000 });
     }
 
-    // 7. Vote
+    // 8. Vote
     const voted = await vote(mainPage, log);
     if (voted) return { result: 'success', email };
 
