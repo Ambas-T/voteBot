@@ -36,12 +36,12 @@ async function waitForCheckpoint(
   timeoutMs = 15_000,
 ): Promise<boolean> {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const body = (await page.textContent('body') ?? '').toLowerCase();
+    const body = (await page.innerText('body').catch(() => '')).toLowerCase();
 
     if (body.includes('failed to verify your browser')) {
       log('Checkpoint blocked — retrying…');
       await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
-      await page.waitForTimeout(3000);
+      await page.waitForTimeout(1500);
       continue;
     }
 
@@ -56,7 +56,7 @@ async function waitForCheckpoint(
       if (attempt === 0) {
         log('Checkpoint did not clear — retrying…');
         await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(1000);
       }
     }
   }
@@ -132,12 +132,14 @@ async function signup(
     const confirm = page.locator('#confirmPassword, input[placeholder*="confirm" i]').first();
     if (await confirm.isVisible({ timeout: 1000 }).catch(() => false)) await confirm.fill(PASSWORD);
 
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(200);
     await page.locator('button[type="submit"], input[type="submit"]').first().click();
-    await page.waitForTimeout(3000);
+    // Wait for navigation or body change instead of fixed delay
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForTimeout(1500);
 
     const url  = page.url();
-    const body = (await page.textContent('body') ?? '').toLowerCase();
+    const body = (await page.innerText('body').catch(() => '')).toLowerCase();
 
     // Check for verification FIRST — the signup page may include text like
     // "Already have an account?" which would falsely match a naive "already" check.
@@ -160,6 +162,14 @@ async function signup(
       await snap(page, 'signup-already');
       log(`Already registered — body snippet: ${body.slice(0, 200)}`);
       return 'already';
+    }
+
+    if (
+      body.includes('signup failed') || body.includes('registration failed') ||
+      body.includes('try again later') || body.includes('too many')
+    ) {
+      log('Signup rate-limited by server — circuit rotation needed');
+      return 'fail';
     }
 
     if (!url.includes('/signup')) {
@@ -192,9 +202,10 @@ async function login(page: Page, email: string, log: (m: string) => void): Promi
   try {
     await page.locator('#email, input[type="email"]').first().fill(email);
     await page.locator('#password, input[type="password"]').first().fill(PASSWORD);
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(200);
     await page.locator('button[type="submit"]').first().click();
-    await page.waitForTimeout(4000);
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForTimeout(2000);
 
     if (page.url().includes('/login')) {
       await snap(page, 'login-fail');
@@ -211,84 +222,89 @@ async function login(page: Page, email: string, log: (m: string) => void): Promi
 
 // ── Vote ─────────────────────────────────────────────────────────────────────
 
+const SUBMISSION_ID = 'e2efa077-c740-456d-89ef-915473b3961d';
+
 async function vote(page: Page, log: (m: string) => void): Promise<boolean> {
-  log('Navigating to submission…');
+  // Fast path: call the vote API directly via fetch inside the browser context.
+  // The page already has session cookies from signup/verification — no need to
+  // load the heavy Next.js submission page (saves 8-15s through Tor).
+  log('Voting via API…');
+  try {
+    const apiResult = await page.evaluate(async (subId: string) => {
+      const payloads = [
+        { submissionId: subId },
+        { id: subId },
+        { submission_id: subId },
+      ];
+      for (const body of payloads) {
+        try {
+          const res = await fetch('/api/vote', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const json = await res.json().catch(() => null);
+          if (json && json.success) return { ok: true, count: json.voteCount ?? null };
+          if (res.status === 401 || res.status === 403) return { ok: false, count: null, reason: 'unauthorized' };
+          if (json && !json.success) return { ok: false, count: null, reason: `rejected: ${JSON.stringify(json).slice(0, 80)}` };
+        } catch { /* try next payload */ }
+      }
+      return { ok: false, count: null, reason: 'all-payloads-failed' };
+    }, SUBMISSION_ID);
+
+    if (apiResult.ok) {
+      log(`Vote registered ✓ (API, count: ${apiResult.count ?? '?'})`);
+      return true;
+    }
+    log(`API vote failed (${(apiResult as any).reason}) — falling back to UI…`);
+  } catch (err) {
+    log(`API vote error: ${err} — falling back to UI…`);
+  }
+
+  // Fallback: load the full submission page and click the button
+  log('Loading submission page (fallback)…');
   await page.goto(SUBMISSION_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
   if (!await waitForCheckpoint(page, log, 'main, button')) return false;
-  await page.waitForTimeout(2000);
 
   try {
-    // The vote button: rounded pill with heart SVG + <span class="font-mono font-bold">count</span>
-    // Disabled + "Sign in to vote" when logged out; enabled when logged in.
-    // After clicking, the heart turns red/filled — the count may not update in
-    // the DOM immediately, so we detect success by class/style change on the button.
     const voteBtn = page.locator('button:has(span.font-mono)').first();
-
-    if (await voteBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-      const isDisabled = await voteBtn.isDisabled();
-      const btnClass = await voteBtn.getAttribute('class') ?? '';
-      const countBefore = await voteBtn.locator('span.font-mono').textContent().catch(() => '?');
-      log(`Vote button: count=${countBefore} disabled=${isDisabled}`);
-
-      if (isDisabled) {
-        log('Vote button is disabled — not logged in');
-        await snap(page, 'vote-not-logged-in');
-        return false;
-      }
-
-      // Intercept the vote API response
-      let apiSuccess = false;
-      let apiCount: number | null = null;
-      const voteResponsePromise = page.waitForResponse(
-        resp => resp.url().includes('/api/vote') && resp.request().method() === 'POST',
-        { timeout: 10_000 },
-      ).then(async resp => {
-        try {
-          const json = await resp.json() as { success?: boolean; voteCount?: number };
-          apiSuccess = !!json.success;
-          apiCount   = json.voteCount ?? null;
-          log(`Vote API: success=${json.success} voteCount=${json.voteCount}`);
-        } catch { /* ignore */ }
-      }).catch(() => {
-        log('Vote API response not captured (may still have worked)');
-      });
-
-      await voteBtn.scrollIntoViewIfNeeded();
-      await voteBtn.click();
-      log('Clicked vote button…');
-      await voteResponsePromise;
-
-      if (apiSuccess) {
-        log(`Vote registered ✓ (count: ${countBefore} → ${apiCount ?? '?'})`);
-        return true;
-      }
-
-      // Fallback: read the DOM count after click
-      await page.waitForTimeout(2000);
-      const countAfter = await voteBtn.locator('span.font-mono').textContent().catch(() => '?');
-      const classAfter = await voteBtn.getAttribute('class') ?? '';
-
-      if (countBefore !== countAfter) {
-        log(`Vote registered ✓ (DOM count: ${countBefore} → ${countAfter})`);
-        return true;
-      }
-      if (classAfter.includes('accent-red') || classAfter.includes('text-red')) {
-        log('Vote accepted ✓ (button switched to active/red state)');
-        return true;
-      }
-
-      await snap(page, 'vote-uncertain');
-      log(`Vote uncertain — count ${countAfter}, class=${classAfter.slice(0, 60)}`);
+    if (!await voteBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      log('Vote button not found');
       return false;
     }
 
-    await snap(page, 'vote-fail');
-    const btns = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('button')).map(b =>
-        `"${b.textContent?.trim().slice(0, 30)}" disabled=${b.disabled} class="${b.className.slice(0, 50)}"`
-      )
-    );
-    log(`Vote button not found. Buttons: ${btns.slice(0, 6).join(' | ')}`);
+    if (await voteBtn.isDisabled()) {
+      log('Vote button disabled — not logged in');
+      return false;
+    }
+
+    let apiSuccess = false;
+    let apiCount: number | null = null;
+    const responsePromise = page.waitForResponse(
+      r => r.url().includes('/api/vote') && r.request().method() === 'POST',
+      { timeout: 10_000 },
+    ).then(async r => {
+      const json = await r.json().catch(() => null) as { success?: boolean; voteCount?: number } | null;
+      if (json) { apiSuccess = !!json.success; apiCount = json.voteCount ?? null; }
+    }).catch(() => {});
+
+    await voteBtn.scrollIntoViewIfNeeded();
+    await voteBtn.click();
+    log('Clicked vote button…');
+    await responsePromise;
+
+    if (apiSuccess) {
+      log(`Vote registered ✓ (UI fallback, count: ${apiCount ?? '?'})`);
+      return true;
+    }
+
+    const classAfter = await voteBtn.getAttribute('class') ?? '';
+    if (classAfter.includes('accent-red') || classAfter.includes('text-red')) {
+      log('Vote accepted ✓ (button turned red)');
+      return true;
+    }
+
+    log('Vote may not have registered');
     return false;
   } catch (err) {
     log(`Vote error: ${err}`);
@@ -325,18 +341,22 @@ export async function runVoteSession(
   }
 
   try {
-    // 1. Get temp mailbox via mail.tm API — server-side, never touches the Tor proxy
+    // 0. Clear previous session so signup page renders fresh each vote
+    await context.clearCookies();
+
+    // 1+2. Get email and generate name in parallel — both are server-side, no proxy involved
     let mailbox: Awaited<ReturnType<typeof getTempMailbox>>;
+    let firstName: string, lastName: string;
     try {
-      mailbox = await getTempMailbox(log);
+      [mailbox, { firstName, lastName }] = await Promise.all([
+        getTempMailbox(log),
+        generateEthiopianName(log),
+      ]);
     } catch (err) {
-      log(`Failed to get temp email: ${err}`);
+      log(`Failed to get temp email or name: ${err}`);
       return { result: 'fail-email', email: '' };
     }
     const email = mailbox.address;
-
-    // 2. Generate Ethiopian name
-    const { firstName, lastName } = await generateEthiopianName(log);
 
     // 3. Sign up on creativeaward.ai  (goes through Tor when TOR_ENABLED=true)
     const mainPage = await newPage();
@@ -353,7 +373,7 @@ export async function runVoteSession(
       }
       log('Navigating to verification link…');
       await mainPage.goto(verifyLink, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-      await mainPage.waitForTimeout(3000);
+      await mainPage.waitForTimeout(1500);
 
       // The verification redirect may pass through resend-links.com → creativeaward.ai
       // Wait for the final destination to load
@@ -361,7 +381,7 @@ export async function runVoteSession(
       log(`After verification → ${verifyUrl}`);
 
       // Check if we landed on a page that requires further action
-      const verifyBody = (await mainPage.textContent('body') ?? '').toLowerCase();
+      const verifyBody = (await mainPage.innerText('body').catch(() => '')).toLowerCase();
       if (verifyBody.includes('verified') || verifyBody.includes('success') || verifyBody.includes('confirmed')) {
         log('Email verified ✓');
       } else {
@@ -376,7 +396,12 @@ export async function runVoteSession(
       log('Login failed — trying to vote anyway in case we have a session…');
     }
 
-    // 6. Vote
+    // 6. Ensure we're on creativeaward.ai before voting (needed for API fetch)
+    if (!mainPage.url().includes('creativeaward.ai')) {
+      await mainPage.goto('https://www.creativeaward.ai/', { waitUntil: 'domcontentloaded', timeout: 20_000 });
+    }
+
+    // 7. Vote via API (fast) or UI fallback
     const voted = await vote(mainPage, log);
     if (voted) return { result: 'success', email };
 

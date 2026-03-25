@@ -20,8 +20,7 @@ import { runVoteSession, SUBMISSION_URL } from './voter';
 const app  = express();
 const PORT = parseInt(process.env.UI_PORT ?? '3000', 10);
 
-// Rotate Tor every N sessions (default 2)
-const VOTES_PER_SESSION = parseInt(process.env.VOTES_PER_SESSION ?? '2', 10);
+const VOTES_PER_SESSION = parseInt(process.env.VOTES_PER_SESSION ?? '3', 10);
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'ui')));
@@ -89,10 +88,10 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
   }
 
   const rawCount = parseInt(String(req.body?.count ?? '0'), 10);
-  const count    = Number.isFinite(rawCount) && rawCount > 0 ? Math.min(rawCount, 100) : 0;
+  const count    = Number.isFinite(rawCount) && rawCount > 0 ? rawCount : 0;
 
   if (count === 0) {
-    res.json({ ok: false, error: 'Provide count (1–100)' });
+    res.json({ ok: false, error: 'Provide count (1+)' });
     return;
   }
 
@@ -114,14 +113,17 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
     let successInBatch = 0;
     let consecutiveFails = 0;
 
+    const usingTor = isTorEnabled()
+      || (process.env.PROXY_MODE ?? '').trim().toLowerCase() === 'tor';
+
     async function rotateCircuit() {
-      if (isTorEnabled()) {
+      if (usingTor) {
         broadcastLog('[tor] Rotating circuit…');
         await rotateTorIP();
-        await waitForNewCircuit(15_000);
+        await waitForNewCircuit(10_000);
         broadcastLog('[tor] New circuit ready.');
       } else {
-        await new Promise(r => setTimeout(r, 1500));
+        await new Promise(r => setTimeout(r, 500));
       }
     }
 
@@ -156,10 +158,8 @@ app.post('/api/vote/start', async (req: Request, res: Response) => {
             consecutiveFails++;
             broadcastLog(`❌ [${state.done}/${state.total}] Failed (${result})${email ? ` — ${email}` : ''}`);
 
-            // If we get a failure, the Tor exit is likely flagged — break
-            // out of this batch so we rotate the circuit immediately
-            if (consecutiveFails >= 1) {
-              broadcastLog('Failure detected — will rotate circuit before next attempt');
+            if (consecutiveFails >= 2) {
+              broadcastLog('2 consecutive failures — rotating circuit');
               break;
             }
           }

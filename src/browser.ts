@@ -25,19 +25,36 @@ function getProxies(): string[] {
     .filter(p => p.length > 0 && !PLACEHOLDER_PATTERNS.some(re => re.test(p)));
 }
 
+type PlaywrightProxy = { server: string; username?: string; password?: string };
+
+function parseProxy(raw: string): PlaywrightProxy {
+  // http://user:pass@host:port  →  split credentials out
+  const m = raw.match(/^(https?):\/\/([^:@]+):([^@]+)@(.+)$/);
+  if (m) {
+    return { server: `${m[1]}://${m[4]}`, username: m[2], password: m[3] };
+  }
+  // host:port:user:pass  (file format)
+  const parts = raw.split(':');
+  if (parts.length === 4) {
+    return { server: `http://${parts[0]}:${parts[1]}`, username: parts[2], password: parts[3] };
+  }
+  return { server: raw };
+}
+
 let proxyIndex = 0;
-function nextProxy(): string | undefined {
+function nextProxy(): PlaywrightProxy | undefined {
   const proxies = getProxies();
   if (!proxies.length) return undefined;
-  const p = proxies[proxyIndex % proxies.length];
+  const raw = proxies[proxyIndex % proxies.length];
   proxyIndex++;
-  console.log(`[browser] proxy: ${p.replace(/:([^@]+)@/, ':***@')}`);
+  const p = parseProxy(raw);
+  console.log(`[browser] proxy: ${p.server} (user: ${p.username?.slice(0, 8)}…)`);
   return p;
 }
 
 // ── Common context options ─────────────────────────────────────────────────
 
-function contextOptions(proxyConfig?: { server: string }) {
+function contextOptions(proxyConfig?: PlaywrightProxy) {
   return {
     viewport: { width: 1280, height: 800 },
     userAgent:
@@ -94,26 +111,25 @@ export async function launchSession(opts?: { headless?: boolean }): Promise<Brow
     return { browser, context, page };
   }
 
-  // ── Local path: playwright-extra + stealth plugin ────────────────────────
+  // ── Local path: plain playwright (parallel-safe, no CDP shim crashes) ──────
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { chromium } = require('playwright-extra');
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-  chromium.use(StealthPlugin());
+  const { chromium } = require('playwright');
 
   const headless =
     opts?.headless !== undefined ? opts.headless : process.env.SHOW_BROWSER !== 'true';
   const slowMo = parseInt(process.env.SLOW_MO ?? '0', 10);
 
-  let proxyUrl: string | undefined;
-  if (isTorEnabled()) {
-    proxyUrl = getTorProxyUrl();
-    console.log(`[browser] Tor → ${proxyUrl}`);
-  } else {
-    proxyUrl = nextProxy();
-  }
+  const proxyMode = (process.env.PROXY_MODE ?? '').trim().toLowerCase()
+    || (isTorEnabled() ? 'tor' : 'none');
 
-  const proxyConfig = proxyUrl ? { server: proxyUrl } : undefined;
+  let proxyConfig: PlaywrightProxy | undefined;
+  if (proxyMode === 'tor') {
+    const torUrl = getTorProxyUrl();
+    console.log(`[browser] Tor → ${torUrl}`);
+    proxyConfig = { server: torUrl };
+  } else if (proxyMode === 'proxies') {
+    proxyConfig = nextProxy();
+  }
 
   const browser: Browser = await chromium.launch({
     headless,
@@ -125,7 +141,7 @@ export async function launchSession(opts?: { headless?: boolean }): Promise<Brow
       '--disable-infobars',
       '--window-size=1280,800',
     ],
-    ...(proxyConfig ? { proxy: proxyConfig } : {}),
+    ...(proxyConfig ? { proxy: { server: proxyConfig.server } } : {}),
   });
 
   const context: BrowserContext = await browser.newContext(contextOptions(proxyConfig));

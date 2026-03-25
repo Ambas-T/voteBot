@@ -79,7 +79,7 @@ export async function waitForVerificationLink(
   log('Polling inbox for verification email…');
 
   while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 5000));
+    await new Promise(r => setTimeout(r, 3000));
 
     let inbox: InboxResp;
     try {
